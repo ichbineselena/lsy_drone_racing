@@ -4,7 +4,7 @@
 # | :-----------------: | :----------------------------: | :-------------------------: | :---------------: | :-------------------: |
 # | `level2.toml`       | *Yes*                          | *Yes*                       | *No*              | Learning, re-planning |
 [controller]
-file = "state_controller_fused_new.py" # Fused: dynamic gate-aware spline + PD tracking
+file = "state_controller_fused.py" # Fused: dynamic gate-aware spline + PD tracking
 
 [deploy]
 ### Settings only relevant for deployment
