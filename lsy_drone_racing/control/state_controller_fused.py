@@ -63,11 +63,24 @@ class StateController(Controller):
                 [-0.5, -0.05, 0.7],
                 [-1.2, -0.2, 0.8],
                 [-1.2, -0.2, 1.2],
-                [-0.0, -0.7, 1.25],
+                [-0.0, -0.7, 1.2],
                 [0.5, -0.75, 1.2],
             ], dtype=float)
             wp[:, 2] = np.maximum(wp[:, 2], self._min_z)
-            self.waypoints = wp
+
+            # If obstacles are present, push any waypoint that is too close
+            # to an obstacle out to a safe distance. This mirrors the
+            # obstacle handling used in the E-style shaping.
+            obstacles = np.asarray(obs.get("obstacles_pos", []), dtype=float)
+            if obstacles.ndim == 2 and obstacles.shape[1] >= 3 and obstacles.shape[0] > 0:
+                safe_dist = 0.3
+                for i, p in enumerate(wp):
+                    for o in obstacles:
+                        d = p - o
+                        dist = np.linalg.norm(d)
+                        if 1e-6 < dist < safe_dist:
+                            wp[i] = o + d / (dist + 1e-12) * safe_dist
+
             return wp
 
         # Else: E-style shaping (gate-aware with offsets)
@@ -120,34 +133,6 @@ class StateController(Controller):
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
-
-        wp = np.array([
-                [-1.5, 0.75, 0.05],
-                [-1.0, 0.55, 0.4],
-                [0.3, 0.35, 0.7],
-                [1.3, -0.15, 0.9],
-                [0.85, 0.85, 1.2],
-                [-0.5, -0.05, 0.7],
-                [-1.2, -0.2, 0.8],
-                [-1.2, -0.2, 1.2],
-                obs["gates_pos"][3],
-                [0.5, -0.75, 1.2],
-            ], dtype=float)
-        # If obstacles are present, slightly repel waypoints away from them
-        if "obstacles_pos" in obs and len(obs["obstacles_pos"]) > 0:
-            obstacles = np.array(obs["obstacles_pos"])
-            safe_dist = 0.3  # meters (minimum desired distance)
-
-
-            for i, wp in enumerate(self.waypoints):
-                for obs_pos in obstacles:
-                    diff = wp - obs_pos
-                    dist = np.linalg.norm(diff)
-                    if dist < safe_dist and dist > 1e-6:
-                        direction = diff / dist
-                        self.waypoints[i] = obs_pos + direction * safe_dist
-                        print(f"Adjusted waypoint {i} to avoid obstacle at {obs_pos}")
-
         t = min(self._tick / self._freq, self._t_total)
         if t >= self._t_total:
             self._finished = True
