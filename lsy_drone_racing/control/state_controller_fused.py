@@ -63,10 +63,11 @@ class StateController(Controller):
                 [-0.5, -0.05, 0.7],
                 [-1.2, -0.2, 0.8],
                 [-1.2, -0.2, 1.2],
-                [-0.0, -0.7, 1.2],
+                [-0.0, -0.75, 1.25],
                 [0.5, -0.75, 1.2],
             ], dtype=float)
             wp[:, 2] = np.maximum(wp[:, 2], self._min_z)
+            self.waypoints = wp
             return wp
 
         # Else: E-style shaping (gate-aware with offsets)
@@ -119,6 +120,22 @@ class StateController(Controller):
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
+
+        # If obstacles are present, slightly repel waypoints away from them
+        if "obstacles_pos" in obs and len(obs["obstacles_pos"]) > 0:
+            obstacles = np.array(obs["obstacles_pos"])
+            safe_dist = 0.3  # meters (minimum desired distance)
+
+
+            for i, wp in enumerate(self.waypoints):
+                for obs_pos in obstacles:
+                    diff = wp - obs_pos
+                    dist = np.linalg.norm(diff)
+                    if dist < safe_dist and dist > 1e-6:
+                        direction = diff / dist
+                        self.waypoints[i] = obs_pos + direction * safe_dist
+                        print(f"Adjusted waypoint {i} to avoid obstacle at {obs_pos}")
+
         t = min(self._tick / self._freq, self._t_total)
         if t >= self._t_total:
             self._finished = True
