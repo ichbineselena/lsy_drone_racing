@@ -63,7 +63,7 @@ class StateController(Controller):
                 [-0.5, -0.05, 0.7],
                 [-1.2, -0.2, 0.8],
                 [-1.2, -0.2, 1.2],
-                [-0.0, -0.75, 1.25],
+                [-0.0, -0.75, 1.2],
                 [0.5, -0.75, 1.2],
             ], dtype=float)
             wp[:, 2] = np.maximum(wp[:, 2], self._min_z)
