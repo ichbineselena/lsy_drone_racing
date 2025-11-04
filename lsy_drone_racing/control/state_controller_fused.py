@@ -121,6 +121,18 @@ class StateController(Controller):
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
 
+        wp = np.array([
+                [-1.5, 0.75, 0.05],
+                [-1.0, 0.55, 0.4],
+                [0.3, 0.35, 0.7],
+                [1.3, -0.15, 0.9],
+                [0.85, 0.85, 1.2],
+                [-0.5, -0.05, 0.7],
+                [-1.2, -0.2, 0.8],
+                [-1.2, -0.2, 1.2],
+                obs["gates_pos"][3],
+                [0.5, -0.75, 1.2],
+            ], dtype=float)
         # If obstacles are present, slightly repel waypoints away from them
         if "obstacles_pos" in obs and len(obs["obstacles_pos"]) > 0:
             obstacles = np.array(obs["obstacles_pos"])
