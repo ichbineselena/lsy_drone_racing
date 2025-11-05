@@ -67,6 +67,20 @@ class StateController(Controller):
                 [0.5, -0.75, 1.2],
             ], dtype=float)
             wp[:, 2] = np.maximum(wp[:, 2], self._min_z)
+
+            # If obstacles are present, push any waypoint that is too close
+            # to an obstacle out to a safe distance. This mirrors the
+            # obstacle handling used in the E-style shaping.
+            obstacles = np.asarray(obs.get("obstacles_pos", []), dtype=float)
+            if obstacles.ndim == 2 and obstacles.shape[1] >= 3 and obstacles.shape[0] > 0:
+                safe_dist = 0.3
+                for i, p in enumerate(wp):
+                    for o in obstacles:
+                        d = p - o
+                        dist = np.linalg.norm(d)
+                        if 1e-6 < dist < safe_dist:
+                            wp[i] = o + d / (dist + 1e-12) * safe_dist
+
             return wp
 
         # Else: E-style shaping (gate-aware with offsets)
