@@ -85,9 +85,9 @@ def create_ocp_solver(
             50.0,  # pos
             50.0,  # pos
             400.0,  # pos
-            1.0,  # rpy
-            1.0,  # rpy
-            1.0,  # rpy
+            3.0,  # rpy (increased to improve attitude tracking)
+            3.0,  # rpy (increased to improve attitude tracking)
+            3.0,  # rpy (increased to improve attitude tracking)
             10.0,  # vel
             10.0,  # vel
             10.0,  # vel
@@ -182,32 +182,8 @@ class AttitudeMPC(Controller):
         self._dt = 1 / config.env.freq
         self._T_HORIZON = self._N * self._dt
 
-        # Same waypoints as in the trajectory controller. Determined by trial and error.
-        waypoints = np.array(
-            [
-                [-1.5, 0.75, 0.05],
-                [-1.0, 0.55, 0.4],
-                [0.3, 0.35, 0.7],
-                [1.3, -0.15, 0.9],
-                [0.85, 0.85, 1.2],
-                [-0.5, -0.05, 0.7],
-                [-1.2, -0.2, 0.8],
-                [-1.2, -0.2, 1.2],
-                [-0.0, -0.7, 1.2],
-                [0.5, -0.75, 1.2],
-            ]
-        )
-        self._t_total = 15  # s
-        t = np.linspace(0, self._t_total, len(waypoints))
-        self._des_pos_spline = CubicSpline(t, waypoints)
-        self._des_vel_spline = self._des_pos_spline.derivative()
-        self._waypoints_pos = self._des_pos_spline(
-            np.linspace(0, self._t_total, int(config.env.freq * self._t_total))
-        )
-        self._waypoints_vel = self._des_vel_spline(
-            np.linspace(0, self._t_total, int(config.env.freq * self._t_total))
-        )
-        self._waypoints_yaw = self._waypoints_pos[:, 0] * 0
+        # Trajectory generation now happens online based on the next gate.
+        # No pre-defined waypoints are stored.
 
         self.drone_params = load_params("so_rpy", config.sim.drone_model)
         self._acados_ocp_solver, self._ocp = create_ocp_solver(
@@ -219,9 +195,150 @@ class AttitudeMPC(Controller):
         self._ny_e = self._nx
 
         self._tick = 0
-        self._tick_max = len(self._waypoints_pos) - 1 - self._N
+        self._tick_max = None
         self._config = config
         self._finished = False
+        # Obstacle avoidance parameters (reference shaping)
+        self._avoid_influence_radius = 0.6
+        self._avoid_safe_radius = 0.25
+        self._avoid_step = 0.15
+        # Gate approach shaping
+        self._gate_d_before = 0.8
+        self._gate_d_after = 0.8
+        self._ref_max_speed = 0.85  # m/s cap for reference to avoid overshoot
+        # Funnel corridor: start (wider) -> end (tighter) across last points
+        self._gate_corridor_y = 0.30  # start lateral half-width (m)
+        self._gate_corridor_z = 0.30  # start vertical half-height (m)
+        self._gate_corridor_y_end = 0.12  # end lateral half-width (m)
+        self._gate_corridor_z_end = 0.12  # end vertical half-height (m)
+        self._gate_corridor_pts = 8   # number of last horizon points to clamp
+        # Soft centering along approach (fractional shrink of lateral/vertical offsets)
+        self._soft_center_gain = 0.6
+
+    def _get_gate_pose_from_config(self, idx: int) -> tuple[np.ndarray, float]:
+        gate = self._config.env.track.gates[idx]
+        pos = np.array(gate.pos, dtype=float)
+        yaw = float(gate.rpy[2]) if hasattr(gate, "rpy") else 0.0
+        return pos, yaw
+
+    def _compute_horizon_refs(
+        self, obs: dict[str, NDArray[np.floating]], info: dict | None
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        x_pos = np.asarray(obs["pos"], dtype=float)
+        tgt_idx = int(obs.get("target_gate", 0)) if isinstance(obs, dict) else 0
+
+        if tgt_idx == -1:
+            tgt_idx = len(self._config.env.track.gates) - 1
+
+        gate_pos, gate_yaw = self._get_gate_pose_from_config(tgt_idx)
+
+        n = np.array([np.cos(gate_yaw), np.sin(gate_yaw), 0.0])
+        d_before = float(self._gate_d_before)
+        d_after = float(self._gate_d_after)
+        p1 = gate_pos - d_before * n
+        p2 = gate_pos + d_after * n
+
+        pos_ref = np.zeros((self._N, 3))
+        N1 = max(1, self._N // 2)
+        N2 = self._N - N1
+
+        for k in range(self._N):
+            if k < N1:
+                s = k / max(1, N1 - 1)
+                pos_ref[k] = x_pos + s * (p1 - x_pos)
+            else:
+                s = (k - N1) / max(1, N2 - 1)
+                pos_ref[k] = p1 + s * (p2 - p1)
+
+        # Apply obstacle avoidance shaping
+        pos_ref = self._avoid_obstacles(pos_ref)
+
+        # Limit reference step size to cap speed (helps avoid gate frame impacts)
+        max_step = self._ref_max_speed * self._dt
+        for k in range(1, self._N):
+            dpos = pos_ref[k] - pos_ref[k - 1]
+            norm = np.linalg.norm(dpos)
+            if norm > max_step and norm > 1e-8:
+                pos_ref[k] = pos_ref[k - 1] + dpos * (max_step / norm)
+
+        # Softly pull the entire horizon toward the gate centerline (n-direction)
+        t_lat = np.array([-np.sin(gate_yaw), np.cos(gate_yaw), 0.0])
+        for k in range(self._N):
+            if self._N <= 1:
+                continue
+            alpha = self._soft_center_gain * (k / (self._N - 1))
+            if alpha <= 0:
+                continue
+            p = pos_ref[k]
+            delta = p - gate_pos
+            x_local = float(np.dot(delta, n))
+            y_local = float(np.dot(delta, t_lat))
+            z_local = float(delta[2])
+            y_local *= max(0.0, 1.0 - alpha)
+            z_local *= max(0.0, 1.0 - alpha)
+            pos_ref[k] = gate_pos + x_local * n + y_local * t_lat + np.array([0.0, 0.0, z_local])
+
+        # Clamp last few points to a safe corridor inside the gate opening (funnel)
+        L = min(self._gate_corridor_pts, self._N)
+        # Lateral unit vector in plane (rotate normal by +90deg about z)
+        t_lat = np.array([-np.sin(gate_yaw), np.cos(gate_yaw), 0.0])
+        for k in range(self._N - L, self._N):
+            # 0 -> near start of clamped segment, 1 -> at very end
+            frac = 0.0 if L <= 1 else (k - (self._N - L)) / (L - 1)
+            w_y = (1.0 - frac) * self._gate_corridor_y + frac * self._gate_corridor_y_end
+            w_z = (1.0 - frac) * self._gate_corridor_z + frac * self._gate_corridor_z_end
+            p = pos_ref[k]
+            # Components relative to gate center
+            delta = p - gate_pos
+            y_local = float(np.dot(delta, t_lat))
+            z_local = float(delta[2])
+            # Clamp inside corridor
+            y_local = np.clip(y_local, -w_y, w_y)
+            z_local = np.clip(z_local, -w_z, w_z)
+            # Reconstruct point keeping longitudinal component along gate normal
+            x_local = float(np.dot(delta, n))
+            pos_ref[k] = gate_pos + x_local * n + y_local * t_lat + np.array([0.0, 0.0, z_local])
+
+        vel_ref = np.zeros_like(pos_ref)
+        if self._N > 1:
+            vel_ref[:-1] = (pos_ref[1:] - pos_ref[:-1]) / self._dt
+            vel_ref[-1] = vel_ref[-2]
+
+        yaw_ref = np.zeros((self._N,))
+        for k in range(self._N):
+            v = vel_ref[k]
+            if np.linalg.norm(v[:2]) > 1e-3:
+                yaw_ref[k] = np.arctan2(v[1], v[0])
+            else:
+                yaw_ref[k] = 0.0
+        # Lock yaw to gate orientation over last L points to stabilize entry
+        for k in range(self._N - L, self._N):
+            yaw_ref[k] = gate_yaw
+
+        return pos_ref, vel_ref, yaw_ref
+
+    def _avoid_obstacles(self, pos_ref: np.ndarray) -> np.ndarray:
+        obstacles_cfg = getattr(self._config.env.track, "obstacles", [])
+        if not obstacles_cfg:
+            return pos_ref
+        obstacles = [np.array(o.pos, dtype=float) for o in obstacles_cfg]
+        for k in range(len(pos_ref)):
+            p = pos_ref[k]
+            grad = np.zeros(3)
+            for c in obstacles:
+                diff = p - c
+                d = np.linalg.norm(diff)
+                if d < 1e-6:
+                    continue
+                if d < self._avoid_influence_radius:
+                    w = (1.0 / (d + 1e-3) - 1.0 / self._avoid_influence_radius)
+                    if w > 0:
+                        grad += w * diff / d
+                if d < self._avoid_safe_radius:
+                    grad += (self._avoid_safe_radius - d) * diff / d
+            if np.linalg.norm(grad) > 0:
+                pos_ref[k] = p + self._avoid_step * grad
+        return pos_ref
 
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
@@ -236,9 +353,7 @@ class AttitudeMPC(Controller):
         Returns:
             The orientation as roll, pitch, yaw angles, and the collective thrust [r_des, p_des, y_des, t_des] as a numpy array.
         """
-        i = min(self._tick, self._tick_max)
-        if self._tick >= self._tick_max:
-            self._finished = True
+        i = self._tick
 
         # Setting initial state
         obs["rpy"] = R.from_quat(obs["quat"]).as_euler("xyz")
@@ -247,33 +362,43 @@ class AttitudeMPC(Controller):
         self._acados_ocp_solver.set(0, "lbx", x0)
         self._acados_ocp_solver.set(0, "ubx", x0)
 
-        # Setting state reference
+        # Setting state reference (online gate-aware generation)
         yref = np.zeros((self._N, self._ny))
-        yref[:, 0:3] = self._waypoints_pos[i : i + self._N]  # position
-        # zero roll, pitch
-        yref[:, 5] = self._waypoints_yaw[i : i + self._N]  # yaw
-        yref[:, 6:9] = self._waypoints_vel[i : i + self._N]  # velocity
-        # zero drpy
+        pos_ref, vel_ref, yaw_ref = self._compute_horizon_refs(obs, info)
+        yref[:, 0:3] = pos_ref
+        yref[:, 5] = yaw_ref
+        yref[:, 6:9] = vel_ref
 
-        # Setting input reference (index > self._nx)
-        # zero rpy
-        # hover thrust
-        yref[:, 15] = self.drone_params["mass"] * -self.drone_params["gravity_vec"][-1]
+        # Setting input reference (index > self._nx): zero rpy, hover thrust
+        thrust_idx = self._nx + self._nu - 1
+        yref[:, thrust_idx] = (
+            self.drone_params["mass"] * -self.drone_params["gravity_vec"][-1]
+        )
         for j in range(self._N):
             self._acados_ocp_solver.set(j, "yref", yref[j])
 
         # Setting final state reference
         yref_e = np.zeros((self._ny_e))
-        yref_e[0:3] = self._waypoints_pos[i + self._N]  # position
-        # zero roll, pitch
-        yref_e[5] = self._waypoints_yaw[i + self._N]  # yaw
-        yref_e[6:9] = self._waypoints_vel[i + self._N]  # velocity
-        # zero drpy
-        self._acados_ocp_solver.set(self._N, "y_ref", yref_e)
+        yref_e[0:3] = pos_ref[-1]
+        yref_e[5] = yaw_ref[-1]
+        yref_e[6:9] = vel_ref[-1]
+        self._acados_ocp_solver.set(self._N, "yref_e", yref_e)
 
         # Solving problem and getting first input
-        self._acados_ocp_solver.solve()
-        u0 = self._acados_ocp_solver.get(0, "u")
+        status = self._acados_ocp_solver.solve()
+        if status != 0:
+            u0 = np.array(
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    self.drone_params["mass"]
+                    * -self.drone_params["gravity_vec"][-1],
+                ],
+                dtype=float,
+            )
+        else:
+            u0 = self._acados_ocp_solver.get(0, "u")
 
         return u0
 

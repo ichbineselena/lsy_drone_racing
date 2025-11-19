@@ -304,6 +304,16 @@ class RaceCoreEnv:
 
         # Load the track into the simulation and compile the reset and step functions with hooks
         self._setup_sim(randomizations)
+        # Cache body ids for classification of contacts
+        try:
+            self._gate_body_ids = [self.sim.mj_model.body(f"gate:{i}").id for i in range(len(self.gates["pos"]))]
+            self._obstacle_body_ids = [
+                self.sim.mj_model.body(f"obstacle:{i}").id for i in range(len(self.obstacles["pos"]))
+            ]
+        except Exception:
+            self._gate_body_ids = []
+            self._obstacle_body_ids = []
+        self._last_contact_info: dict[str, Any] = {}
 
         # Create the environment data struct.
         n_gates, n_obstacles = len(track.gates), len(track.obstacles)
@@ -390,6 +400,11 @@ class RaceCoreEnv:
         self.data = self._step_env(
             self.data, drone_pos, mocap_pos, mocap_quat, contacts, self.sim.freq
         )
+        # Update last contact info (non-jitted, single-world focus)
+        try:
+            self._update_last_contact_info(drone_pos, contacts)
+        except Exception:
+            pass
         # Auto-reset envs. Add configuration option to disable for single-world envs
         if self.autoreset and marked_for_reset.any():
             self._reset(mask=marked_for_reset)
@@ -479,7 +494,12 @@ class RaceCoreEnv:
 
     def info(self) -> dict:
         """Return an info dictionary containing additional information about the environment."""
-        return {}
+        # Provide per-(world,drone) object array so downstream indexing [0,0] works
+        arr = np.empty((self.sim.n_worlds, self.sim.n_drones), dtype=object)
+        arr[:] = None
+        # For single-drone env we populate [0,0]
+        arr[0, 0] = self._last_contact_info
+        return {"last_contact": arr}
 
     @property
     def drone_mass(self) -> NDArray[np.floating]:
@@ -653,6 +673,80 @@ class RaceCoreEnv:
             obstacle.pos = self.obstacles["pos"][i]
             obstacle.mocap = True
         self.sim.build_mjx()
+
+    def _update_last_contact_info(self, drone_pos: Array, contacts: Array) -> None:
+        """Populate last contact info with position and classification if available."""
+        # Assume single world and first drone for logging
+        w = 0
+        d = 0
+        # Convert to numpy for inspection
+        contact_mask = np.asarray(contacts)[w]
+        dmasks = np.asarray(self.data.contact_masks)[w, d]
+        active = np.where(contact_mask & dmasks)[0]
+        pos_np = np.asarray(drone_pos)[w, d]
+
+        # Bounds classification
+        low = np.asarray(self.data.pos_limit_low)[w]
+        high = np.asarray(self.data.pos_limit_high)[w]
+        out_of_bounds = bool((pos_np < low).any() or (pos_np > high).any())
+
+        info: dict[str, Any] = {}
+        if active.size > 0:
+            c_impl = self.sim.mjx_data._impl.contact
+            # Prefer most penetrating or first
+            idx = int(active[0])
+            try:
+                # Choose the most negative distance if available
+                dist = np.asarray(getattr(c_impl, "dist", None))
+                if dist is not None:
+                    cand = dist[w, active]
+                    idx = int(active[int(np.argmin(cand))])
+            except Exception:
+                pass
+            # Contact position if available
+            cpos = None
+            try:
+                cpos_arr = np.asarray(getattr(c_impl, "pos", None))
+                if cpos_arr is not None:
+                    cpos = cpos_arr[w, idx]
+            except Exception:
+                cpos = None
+            # Classify the other body
+            try:
+                g1 = int(np.asarray(c_impl.geom1)[w, idx])
+                g2 = int(np.asarray(c_impl.geom2)[w, idx])
+                # Determine if g1 or g2 belongs to the drone body
+                m = self.sim.mj_model
+                drone_body = m.body("drone:0").id
+                # geom->body id mapping
+                geom_bodyid = np.asarray(m.geom_bodyid)
+                g1_body = int(geom_bodyid[g1])
+                g2_body = int(geom_bodyid[g2])
+                other_body = g2_body if g1_body == drone_body else g1_body
+                ctype = "other"
+                cindex: int | None = None
+                if other_body in self._gate_body_ids:
+                    ctype = "gate"
+                    cindex = int(self._gate_body_ids.index(other_body))
+                elif other_body in self._obstacle_body_ids:
+                    ctype = "obstacle"
+                    cindex = int(self._obstacle_body_ids.index(other_body))
+                elif other_body == m.body("world").id:
+                    ctype = "world"
+                info = {
+                    "type": ctype,
+                    "pos": pos_np.tolist() if cpos is None else np.asarray(cpos).tolist(),
+                }
+                if cindex is not None:
+                    info["index"] = cindex
+            except Exception:
+                # Fallback to position only
+                info = {"type": "contact", "pos": pos_np.tolist() if cpos is None else np.asarray(cpos).tolist()}
+        elif out_of_bounds:
+            info = {"type": "bounds", "pos": pos_np.tolist()}
+        else:
+            info = {}
+        self._last_contact_info = info
 
     @staticmethod
     def _load_contact_masks(sim: Sim) -> Array:  # , data: EnvData

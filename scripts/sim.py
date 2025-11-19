@@ -76,6 +76,8 @@ def simulate(
     ep_times = []
     for _ in range(n_runs):  # Run n_runs episodes with the controller
         obs, info = env.reset()
+        # Log gate & obstacle poses for this run
+        _log_run_objects(obs)
         controller: Controller = controller_cls(obs, info, config)
         i = 0
         fps = 60
@@ -99,6 +101,8 @@ def simulate(
             )
             # Add up reward, collisions
             if terminated or truncated or controller_finished:
+                # Print collision details if available (env.info includes last_contact)
+                _log_episode_end_details(obs, info, config, terminated, truncated)
                 break
             if config.sim.render:  # Render the sim if selected.
                 if ((i * fps) % config.env.freq) < fps:
@@ -124,6 +128,118 @@ def log_episode_stats(obs: dict, info: dict, config: ConfigDict, curr_time: floa
     logger.info(
         f"Flight time (s): {curr_time}\nFinished: {finished}\nGates passed: {gates_passed}\n"
     )
+
+
+def _np(a):
+    try:
+        return np.asarray(a)
+    except Exception:
+        return a
+
+
+def _squeeze(a):
+    return np.asarray(a).squeeze()
+
+
+def _log_run_objects(obs: dict):
+    """Log the gates and obstacles positions at the start of each run."""
+    try:
+        gates_pos = _squeeze(obs.get("gates_pos"))
+        obstacles_pos = _squeeze(obs.get("obstacles_pos"))
+        # Expect shapes: (n_gates,3) and (n_obstacles,3)
+        if gates_pos.ndim == 1:
+            gates_pos = gates_pos[None, :]
+        if obstacles_pos.ndim == 1:
+            obstacles_pos = obstacles_pos[None, :]
+        gp_str = ", ".join([f"g{i}={gates_pos[i].tolist()}" for i in range(len(gates_pos))])
+        op_str = ", ".join(
+            [f"o{i}={obstacles_pos[i].tolist()}" for i in range(len(obstacles_pos))]
+        )
+        logger.info(f"Run objects -> Gates: [{gp_str}] | Obstacles: [{op_str}]")
+    except Exception as e:
+        logger.warning(f"Failed to log run objects: {e}")
+
+
+def _log_episode_end_details(obs: dict, info: dict, config: ConfigDict, terminated: bool, truncated: bool):
+    """On episode end, print likely collision details if not finished.
+
+    Heuristics:
+    - If target_gate == -1: finished; nothing to report.
+    - Else if terminated: likely contact or bounds; report drone pos and nearest gate/obstacle.
+    - Else if truncated: time limit; report last pos and nearest objects for context.
+    """
+    try:
+        tgt = int(_squeeze(obs.get("target_gate", -2)))
+        pos = _squeeze(obs.get("pos"))
+        gates_pos = _squeeze(obs.get("gates_pos", np.zeros((0, 3))))
+        obstacles_pos = _squeeze(obs.get("obstacles_pos", np.zeros((0, 3))))
+        if pos.ndim != 1 or pos.shape[-1] != 3:
+            return
+        # Normalize shapes
+        if gates_pos.size == 0:
+            gates_pos = np.zeros((0, 3))
+        if obstacles_pos.size == 0:
+            obstacles_pos = np.zeros((0, 3))
+        if gates_pos.ndim == 1:
+            gates_pos = gates_pos[None, :]
+        if obstacles_pos.ndim == 1:
+            obstacles_pos = obstacles_pos[None, :]
+
+        # Finished -> skip unless a contact was recorded
+        if tgt == -1 and not info.get("last_contact"):
+            return
+
+        # Distances
+        def _min_dist(mat):
+            if mat.shape[0] == 0:
+                return (np.inf, -1)
+            d = np.linalg.norm(mat - pos[None, :], axis=1)
+            idx = int(np.argmin(d))
+            return (float(d[idx]), idx)
+
+        d_gate, gi = _min_dist(gates_pos)
+        d_obs, oi = _min_dist(obstacles_pos)
+
+        # Bounds check vs env defaults (RaceCoreEnv uses fixed bounds)
+        bounds_low = np.array([-3.0, -3.0, -1e-3])
+        bounds_high = np.array([3.0, 3.0, 2.5])
+        out_of_bounds = np.any(pos < bounds_low) or np.any(pos > bounds_high)
+
+        reason = "terminated" if terminated else ("time-limit" if truncated else "ended")
+        msg = [f"End ({reason}) @ drone_pos={pos.tolist()}"]
+
+        # Prefer exact contact from env if present
+        lc = info.get("last_contact") or {}
+        if lc:
+            ctype = lc.get("type")
+            cpos = lc.get("pos")
+            cidx = lc.get("index")
+            if ctype == "gate" and cidx is not None:
+                msg.append(f"contact gate g{cidx} @ {cpos}")
+                logger.info(" | ".join(msg))
+                return
+            if ctype == "obstacle" and cidx is not None:
+                msg.append(f"contact obstacle o{cidx} @ {cpos}")
+                logger.info(" | ".join(msg))
+                return
+            if ctype in ("world", "bounds", "contact"):
+                msg.append(f"contact {ctype} @ {cpos}")
+                logger.info(" | ".join(msg))
+                return
+
+        if out_of_bounds:
+            msg.append("likely out-of-bounds")
+
+        if d_obs < d_gate - 0.05:
+            near = f"nearest obstacle o{oi} @ {obstacles_pos[oi].tolist()} (d={d_obs:.3f}m)"
+            msg.append(near)
+        elif gi >= 0:
+            near = f"nearest gate g{gi} @ {gates_pos[gi].tolist()} (d={d_gate:.3f}m)"
+            msg.append(near)
+
+        logger.info(" | ".join(msg))
+    except Exception as e:
+        logger.warning(f"Failed to log end details: {e}")
 
 
 if __name__ == "__main__":
