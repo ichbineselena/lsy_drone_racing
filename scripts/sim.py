@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 def simulate(
-    config: str = "level2.toml",
+    config: str = "level1.toml",
     controller: str | None = None,
     n_runs: int = 1,
     render: bool | None = None,
@@ -54,6 +54,9 @@ def simulate(
     if render is None:
         render = config.sim.render
     else:
+        # Convert string to bool if necessary (fire.Fire passes CLI args as strings)
+        if isinstance(render, str):
+            render = render.lower() in ('true', '1', 'yes', 'on')
         config.sim.render = render
     # Load the controller module
     control_path = Path(__file__).parents[1] / "lsy_drone_racing/control"
@@ -84,10 +87,29 @@ def simulate(
             curr_time = i / config.env.freq
 
             action = controller.compute_control(obs, info)
+            # Draw planned trajectory from controller (if provided).
+            # Controllers may expose a `get_planned_trajectory()` method returning an (N,3) array
+            # or a `_last_planned_pos` attribute.
+            try:
+                traj_points = None
+                if hasattr(controller, "get_planned_trajectory"):
+                    traj_points = controller.get_planned_trajectory()
+                elif hasattr(controller, "_last_planned_pos"):
+                    traj_points = getattr(controller, "_last_planned_pos")
+                if traj_points is not None:
+                    # ensure an ndarray and correct shape
+                    import numpy as _np
+
+                    traj_points = _np.asarray(traj_points)
+                    if traj_points.ndim == 2 and traj_points.shape[1] == 3:
+                        draw_line(env, traj_points)
+            except Exception:
+                # drawing must never break the sim loop
+                pass
             # Convert to a buffer that meets XLA's alginment restrictions to prevent warnings. See
             # https://github.com/jax-ml/jax/discussions/6055
-            traj_points = controller._des_pos_spline(np.linspace(0, controller._t_total, 200))
-            draw_line(env, traj_points)
+            # traj_points = controller._des_pos_spline(np.linspace(0, controller._t_total, 200))
+            # draw_line(env, traj_points)
             # Tracking issue:
             # https://github.com/jax-ml/jax/issues/29810
             action = np.asarray(jp.asarray(action), copy=True)
