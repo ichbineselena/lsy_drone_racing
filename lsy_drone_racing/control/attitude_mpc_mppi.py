@@ -205,14 +205,22 @@ class AttitudeMPC(Controller):
 
         use_pytorch_mppi = False
         tb_choice = trajectory_builder if trajectory_builder is not None else tb_cfg_val
+        for gate in config.env.track.gates:
+            self.gate_pos = np.array(gate["pos"], dtype=float)
+            self.gate_rpy = np.array(gate["rpy"], dtype=float)
+            rot = R.from_euler("xyz", self.gate_rpy)
+            self.gate_normal = rot.as_matrix()[:, 0]  # x-axis points through gate
+
         if isinstance(tb_choice, str) and tb_choice.lower() in ("pytorch_mppi", "pytorch-mppi", "pytorchmppi", "mppi"):
             use_pytorch_mppi = True
 
         self._use_pytorch_mppi = use_pytorch_mppi
         if self._use_pytorch_mppi:
             # create a simple MPPI using a pos/vel kinematic model (6D state, 3D accel control)
-            self.goal = obs["gates_pos"][0]
-            self.mppi_dt = 0.05 #self._dt
+            self.goal = obs["gates_pos"][obs["target_gate"]]
+            self.gates = obs["gates_pos"]
+            self.mppi_dt = 0.04 #self._dt
+            self.target_gate_idx = int(obs["target_gate"])
 
             def dynamics(x, u):
                 px, py, pz, vx, vy, vz = torch.split(x, 1, dim=-1)
@@ -232,14 +240,68 @@ class AttitudeMPC(Controller):
                 goal_t = torch.tensor(self.goal, device=x.device, dtype=x.dtype)
                 pos = x[..., :3]
                 vel = x[..., 3:6]
-                   # --- 1. Position error ---
+                # gate quaternion → rotation matrix → normal
+                gate_quat = torch.tensor(obs["gates_quat"][self.target_gate_idx],
+                                        device=x.device, dtype=x.dtype)
+
+                rot = R.from_quat(gate_quat.cpu().numpy())
+                gate_normal_np = rot.as_matrix()[:, 0]     # x-axis is forward direction
+                gate_normal = torch.tensor(gate_normal_np, device=x.device, dtype=x.dtype)
+
+                gate_normal = gate_normal / torch.norm(gate_normal)
+
+                # gate center
+                gate_center = torch.tensor(obs["gates_pos"][self.target_gate_idx],
+                                        device=x.device, dtype=x.dtype)
+
+                # Build orthonormal basis: n, t1, t2
+                n = gate_normal
+                # pick arbitrary vector not parallel to n
+                tmp = torch.tensor([1.,0.,0.], device=x.device, dtype=x.dtype)
+                if torch.abs(torch.dot(tmp,n)) > 0.8:
+                    tmp = torch.tensor([0.,1.,0.], device=x.device, dtype=x.dtype)
+
+                t1 = torch.cross(n, tmp)
+                t1 = t1 / torch.norm(t1)
+                t2 = torch.cross(n, t1)
+                t2 = t2 / torch.norm(t2)
+
+                d = pos - gate_center
+
+                # axis projections
+                proj_n  = torch.sum(d * n, dim=-1)
+                proj_t1 = torch.sum(d * t1, dim=-1)
+                proj_t2 = torch.sum(d * t2, dim=-1)
+
+                # ellipse radii
+                a = torch.tensor(1.2, device=x.device)   # long axis → through the gate
+                b = torch.tensor(0.3, device=x.device)   # narrow axis → the gate's plane
+
+                # elliptical distance
+                ellipse_dist = (proj_n / a)**2 + (proj_t1 / b)**2 + (proj_t2 / b)**2
+
+                W_ellipse = 50.0   # tune weight
+
+                c_ellipse = - W_ellipse / ellipse_dist
+                # --- 1. Position error ---
                 # Weight z (altitude) more heavily to ensure takeoff
-                W_pos = torch.tensor([1.0, 1.0, 5.0], device=x.device, dtype=x.dtype)
+                W_pos = torch.tensor([10.0, 10.0, 50.0], device=x.device, dtype=x.dtype)
                 c_pos = torch.sum(W_pos * (pos - goal_t) ** 2, dim=-1)
+
+                # vectorized check: if any sampled trajectory is within threshold,
+                # consider the gate passed (use torch.any to reduce to a single boolean)
+                if torch.any(torch.norm(pos - goal_t, p=2, dim=-1) < 0.2):
+                    # passed gate, switch to next (guard against racing beyond last gate)
+                    c_pos = c_pos * 0.1  # reduce cost for passing gate
+                    # if self.target_gate_idx + 1 < len(self.gates):
+                    #     self.target_gate_idx += 1
+                    #     self.goal = self.gates[self.target_gate_idx]
+                    #     print(f"[DEBUG] MPPI goal switched to gate index {self.target_gate_idx} "
+                    #         f"at position {self.goal}")
 
                 # --- 2. Velocity penalty ---
                 # Encourage reaching goal with moderate speed
-                W_vel = torch.tensor([0.1, 0.1, 0.5], device=x.device, dtype=x.dtype)
+                W_vel = torch.tensor([0.1, 0.1, 0.1], device=x.device, dtype=x.dtype)
                 c_vel = torch.sum(W_vel * vel ** 2, dim=-1)
 
                 # --- 3. Control effort penalty ---
@@ -247,14 +309,68 @@ class AttitudeMPC(Controller):
                 W_u = torch.tensor([0.01] * u.shape[-1], device=x.device, dtype=x.dtype)
                 c_u = torch.sum(W_u * u ** 2, dim=-1)
 
-                # Total cost
-                total_cost = c_pos + c_vel + c_u
+                #  # --- 4. Gate alignment cost ---
+                # # Compute gate normal
+                # i = self.target_gate_idx
+                # rot = R.from_quat(obs["gates_quat"][i])
+                # det_euler = rot.as_euler("xyz")
+                # nom_pitch = self.gates_rpy[i]["rpy"][1]
+                # if abs(det_euler[1] - nom_pitch) < self._pitch_lock_thresh:
+                #     det_euler[1] = nom_pitch
+                #     rot = R.from_euler("xyz", det_euler)
+
+                # gate_normal = torch.tensor(rot.as_matrix()[:, 0], device=x.device, dtype=x.dtype)
+                # gate_normal = gate_normal / torch.norm(gate_normal)
+
+                # # Cosine similarity: dot(v, n) / (||v||*||n||)
+                # vel_norm = torch.norm(vel, dim=-1) + 1e-6
+                # dot_prod = torch.sum(vel * gate_normal, dim=-1)
+                # alignment_cost = 1.0 - dot_prod / vel_norm  # 0 if perfectly aligned, increases otherwise
+
+                # # Weight the alignment term
+                # W_align = 5.0
+                # c_align = W_align * alignment_cost
+
+                # --- Total cost ---
+                total_cost = c_pos + c_vel + c_u + c_ellipse
+                #print(f"[DEBUG] MPPI running cost components: pos {c_pos.mean().item():.3f}, ")
 
                 return total_cost
 
+            # def running_cost(x, u):
+                
+            #     pos = x[..., :3]  # (T+1, num_samples, 3)
+            #     T_horizon, num_samples = pos.shape[:2]
+
+            #     # Initialize per-sample cost
+            #     cost = torch.zeros(num_samples, dtype=x.dtype, device=x.device)
+
+            #     # Current gate
+            #     current_gate_idx = self.target_gate_idx
+            #     current_gate = torch.tensor(self.gates[current_gate_idx], device=x.device, dtype=x.dtype)
+
+            #     for k in range(T_horizon - 1):
+            #         # squared distances to gate
+            #         dist_prev = torch.sum((pos[k] - current_gate) ** 2, dim=-1)   # shape (num_samples,)
+            #         dist_next = torch.sum((pos[k+1] - current_gate) ** 2, dim=-1) # shape (num_samples,)
+            #         cost += dist_next - dist_prev
+
+            #         # switch gate if passed
+            #         passed = torch.norm(pos[k+1] - current_gate, dim=-1) < 0.5  # boolean mask
+            #         if torch.any(passed):
+            #             if current_gate_idx + 1 < len(self._current_gates):
+            #                 current_gate_idx += 1
+            #                 current_gate = torch.tensor(self._current_gates[current_gate_idx], device=x.device, dtype=x.dtype)
+
+            #     # Add control effort penalty per sample
+            #     cost += 0.01 * torch.sum(u**2, dim=(-1, -2))  # sum over T and control dims
+
+            #     return cost 
+
+
             H = 60 #self._N
-            K = 2048  # samples; tune for performance
-            noise_sigma_matrix = 0.3 * torch.eye(3)
+            K = 4000# samples; tune for performance
+            noise_sigma_matrix = 0.2 * torch.eye(3)
 
             # instantiate MPPI solver
             # try:
@@ -273,8 +389,8 @@ class AttitudeMPC(Controller):
                 num_samples=K,
                 horizon=H,
                 lambda_=1.0,
-                u_min=torch.tensor([-3.0], dtype=torch.double, device=device),
-                u_max=torch.tensor([ 3.0], dtype=torch.double, device=device),
+                u_min=torch.tensor([-2.0], dtype=torch.double, device=device),
+                u_max=torch.tensor([ 2.0], dtype=torch.double, device=device),
                 device=device,
             )
             print("[AttitudeMPC] Using PyTorch MPPI as high-level trajectory planner.")
@@ -326,13 +442,10 @@ class AttitudeMPC(Controller):
             # ======================================================
             # 1. Determine goal from observation (gate detection)
             # ======================================================
-            try:
-                target_gate_idx = int(obs["target_gate"])
-                self.goal = obs["gates_pos"][target_gate_idx]
-                print(f"[DEBUG] MPPI goal updated to gate index {target_gate_idx} "
-                    f"at position {self.goal}")
-            except Exception:
-                self.goal = obs.get("gates_pos", [None])[0]
+            target_gate_idx = int(obs["target_gate"])
+            self.goal = obs["gates_pos"][target_gate_idx]  # slightly beyond gate
+            print(f"[DEBUG] MPPI goal updated to gate index {target_gate_idx} "
+                f"at position {self.goal}")
 
             # ======================================================
             # 2. Build MPPI input state: (px,py,pz,vx,vy,vz)
@@ -353,7 +466,7 @@ class AttitudeMPC(Controller):
             # 4. Roll out predicted future states
             # ======================================================
             u_seq = self.mppi.U
-            print(f"[DEBUG] MPPI u_seq (first few): {u_seq[:3].cpu().numpy()}")
+            # print(f"[DEBUG] MPPI u_seq (first few): {u_seq[:3].cpu().numpy()}")
 
             x = x0.clone()
             xs = [x.cpu().numpy()]
