@@ -20,8 +20,8 @@ from drone_models.utils.rotation import ang_vel2rpy_rates
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
 import torch
-from pytorch_mppi import MPPI
-
+# from pytorch_mppi import MPPI, smooth_mppi as smppi
+import pytorch_mppi
 from lsy_drone_racing.control import Controller
 from lsy_drone_racing.control.trajectory_builders import SplineBuilder, MPPIBuilder, TrajectoryBuilder
 
@@ -219,7 +219,7 @@ class AttitudeMPC(Controller):
             # create a simple MPPI using a pos/vel kinematic model (6D state, 3D accel control)
             self.goal = obs["gates_pos"][obs["target_gate"]]
             self.gates = obs["gates_pos"]
-            self.mppi_dt = 0.04 #self._dt
+            self.mppi_dt = 0.05 #self._dt
             self.target_gate_idx = int(obs["target_gate"])
 
             def dynamics(x, u):
@@ -287,17 +287,6 @@ class AttitudeMPC(Controller):
                 # Weight z (altitude) more heavily to ensure takeoff
                 W_pos = torch.tensor([10.0, 10.0, 50.0], device=x.device, dtype=x.dtype)
                 c_pos = torch.sum(W_pos * (pos - goal_t) ** 2, dim=-1)
-
-                # vectorized check: if any sampled trajectory is within threshold,
-                # consider the gate passed (use torch.any to reduce to a single boolean)
-                if torch.any(torch.norm(pos - goal_t, p=2, dim=-1) < 0.2):
-                    # passed gate, switch to next (guard against racing beyond last gate)
-                    c_pos = c_pos * 0.1  # reduce cost for passing gate
-                    # if self.target_gate_idx + 1 < len(self.gates):
-                    #     self.target_gate_idx += 1
-                    #     self.goal = self.gates[self.target_gate_idx]
-                    #     print(f"[DEBUG] MPPI goal switched to gate index {self.target_gate_idx} "
-                    #         f"at position {self.goal}")
 
                 # --- 2. Velocity penalty ---
                 # Encourage reaching goal with moderate speed
@@ -370,7 +359,7 @@ class AttitudeMPC(Controller):
 
             H = 60 #self._N
             K = 4000# samples; tune for performance
-            noise_sigma_matrix = 0.2 * torch.eye(3)
+            noise_sigma_matrix = 0.3 * torch.eye(3)
 
             # instantiate MPPI solver
             # try:
@@ -381,7 +370,7 @@ class AttitudeMPC(Controller):
                 device=device
             )
             
-            self.mppi = MPPI(
+            self.mppi = pytorch_mppi.KMPPI(
                 dynamics=dynamics,
                 running_cost=running_cost,
                 nx=6,
@@ -389,8 +378,8 @@ class AttitudeMPC(Controller):
                 num_samples=K,
                 horizon=H,
                 lambda_=1.0,
-                u_min=torch.tensor([-2.0], dtype=torch.double, device=device),
-                u_max=torch.tensor([ 2.0], dtype=torch.double, device=device),
+                u_min=torch.tensor([-2.0], dtype=torch.double, device=device), #[-0.5, -0.5, -0.5]
+                u_max=torch.tensor([2.0], dtype=torch.double, device=device), #[0.5, 0.5, 0.5]
                 device=device,
             )
             print("[AttitudeMPC] Using PyTorch MPPI as high-level trajectory planner.")
@@ -461,6 +450,7 @@ class AttitudeMPC(Controller):
             # ======================================================
             with torch.no_grad():
                 u0 = self.mppi.command(x0)  # first optimal action
+                print("Opt u0: ", u0)
 
             # ======================================================
             # 4. Roll out predicted future states
