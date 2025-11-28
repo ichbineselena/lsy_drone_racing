@@ -213,6 +213,8 @@ class AttitudeMPC(Controller):
 
         if isinstance(tb_choice, str) and tb_choice.lower() in ("pytorch_mppi", "pytorch-mppi", "pytorchmppi", "mppi"):
             use_pytorch_mppi = True
+            self.prev_goal = obs["pos"]
+
 
         self._use_pytorch_mppi = use_pytorch_mppi
         if self._use_pytorch_mppi:
@@ -275,7 +277,7 @@ class AttitudeMPC(Controller):
 
                 # ellipse radii
                 a = torch.tensor(1.2, device=x.device)   # long axis → through the gate
-                b = torch.tensor(0.3, device=x.device)   # narrow axis → the gate's plane
+                b = torch.tensor(0.15, device=x.device)   # narrow axis → the gate's plane
 
                 # elliptical distance
                 ellipse_dist = (proj_n / a)**2 + (proj_t1 / b)**2 + (proj_t2 / b)**2
@@ -285,12 +287,12 @@ class AttitudeMPC(Controller):
                 c_ellipse = - W_ellipse / ellipse_dist
                 # --- 1. Position error ---
                 # Weight z (altitude) more heavily to ensure takeoff
-                W_pos = torch.tensor([10.0, 10.0, 50.0], device=x.device, dtype=x.dtype)
+                W_pos = torch.tensor([10.0, 10.0, 20.0], device=x.device, dtype=x.dtype)
                 c_pos = torch.sum(W_pos * (pos - goal_t) ** 2, dim=-1)
 
                 # --- 2. Velocity penalty ---
                 # Encourage reaching goal with moderate speed
-                W_vel = torch.tensor([0.1, 0.1, 0.1], device=x.device, dtype=x.dtype)
+                W_vel = torch.tensor([0.01, 0.01, 0.01], device=x.device, dtype=x.dtype)
                 c_vel = torch.sum(W_vel * vel ** 2, dim=-1)
 
                 # --- 3. Control effort penalty ---
@@ -326,40 +328,10 @@ class AttitudeMPC(Controller):
 
                 return total_cost
 
-            # def running_cost(x, u):
-                
-            #     pos = x[..., :3]  # (T+1, num_samples, 3)
-            #     T_horizon, num_samples = pos.shape[:2]
 
-            #     # Initialize per-sample cost
-            #     cost = torch.zeros(num_samples, dtype=x.dtype, device=x.device)
-
-            #     # Current gate
-            #     current_gate_idx = self.target_gate_idx
-            #     current_gate = torch.tensor(self.gates[current_gate_idx], device=x.device, dtype=x.dtype)
-
-            #     for k in range(T_horizon - 1):
-            #         # squared distances to gate
-            #         dist_prev = torch.sum((pos[k] - current_gate) ** 2, dim=-1)   # shape (num_samples,)
-            #         dist_next = torch.sum((pos[k+1] - current_gate) ** 2, dim=-1) # shape (num_samples,)
-            #         cost += dist_next - dist_prev
-
-            #         # switch gate if passed
-            #         passed = torch.norm(pos[k+1] - current_gate, dim=-1) < 0.5  # boolean mask
-            #         if torch.any(passed):
-            #             if current_gate_idx + 1 < len(self._current_gates):
-            #                 current_gate_idx += 1
-            #                 current_gate = torch.tensor(self._current_gates[current_gate_idx], device=x.device, dtype=x.dtype)
-
-            #     # Add control effort penalty per sample
-            #     cost += 0.01 * torch.sum(u**2, dim=(-1, -2))  # sum over T and control dims
-
-            #     return cost 
-
-
-            H = 60 #self._N
-            K = 4000# samples; tune for performance
-            noise_sigma_matrix = 0.3 * torch.eye(3)
+            H = 35 #self._N
+            K = 200# samples; tune for performance
+            noise_sigma_matrix = 0.2 * torch.eye(3)
 
             # instantiate MPPI solver
             # try:
@@ -400,6 +372,36 @@ class AttitudeMPC(Controller):
         self._config = config
         self._finished = False
 
+    def _warmstart_cubic_spline(self, start_pos, start_vel, goal_pos, horizon, dt):
+            """
+            Build a cubic spline warm-start trajectory from current state to next gate.
+            Returns pos_traj (H×3), vel_traj (H×3)
+            """
+            t = np.linspace(0, horizon * dt, horizon + 1)
+
+            # Boundary conditions: match current position & velocity
+            bc_pos = np.array(start_pos)
+            bc_vel = np.array(start_vel)
+
+            # Create simple straight-line intermediate points
+            # (they only shape the spline; MPPI will refine)
+            # mid1 = bc_pos + 0.33 * (goal_pos - bc_pos) 
+            # mid2 = bc_pos + 0.5 * (goal_pos - bc_pos) 
+            # mid3 = bc_pos + 0.66 * (goal_pos - bc_pos)
+
+            xs = np.vstack([bc_pos, goal_pos]) #mid1, mid2, mid3,
+
+            # Fit 3 independent cubic splines for x,y,z
+            cs_x = CubicSpline([0, 1], xs[:, 0], bc_type=((1, bc_vel[0]), (1, 0.0)))
+            cs_y = CubicSpline([0, 1], xs[:, 1], bc_type=((1, bc_vel[1]), (1, 0.0)))
+            cs_z = CubicSpline([0, 1], xs[:, 2], bc_type=((1, bc_vel[2]), (1, 0.0)))
+
+            # Evaluate over prediction horizon
+            pos_traj = np.stack([cs_x(t), cs_y(t), cs_z(t)], axis=1)
+            vel_traj = np.stack([cs_x(t, 1), cs_y(t, 1), cs_z(t, 1)], axis=1)
+
+            return pos_traj, vel_traj
+
     def compute_control(
     self,
     obs: dict[str, NDArray[np.floating]],
@@ -421,20 +423,50 @@ class AttitudeMPC(Controller):
         self._acados_ocp_solver.set(0, "lbx", x0)
         self._acados_ocp_solver.set(0, "ubx", x0)
 
+
         # ------------------------
         # Query trajectory builder
         # ------------------------
         t_now = self._tick * self._dt
 
         if getattr(self, "_use_pytorch_mppi", False):
-
             # ======================================================
             # 1. Determine goal from observation (gate detection)
             # ======================================================
             target_gate_idx = int(obs["target_gate"])
-            self.goal = obs["gates_pos"][target_gate_idx]  # slightly beyond gate
-            print(f"[DEBUG] MPPI goal updated to gate index {target_gate_idx} "
-                f"at position {self.goal}")
+            self.goal = obs["gates_pos"][target_gate_idx]
+            if self.goal[0] != self.prev_goal[0]:
+                print(f"[DEBUG] MPPI goal updated to gate index {target_gate_idx} "
+                    f"at position {self.goal}")
+                
+                # small forward offset through the gate
+                gate_quat = obs["gates_quat"][target_gate_idx]
+                rot = R.from_quat(gate_quat)
+                forward = rot.as_matrix()[:, 0]
+                goal_ws = self.goal + 0.1 * forward    # warm-start goal
+
+                #self.goal = goal_ws
+
+                # build warm-start from (p,v) → goal_ws
+                start_pos = obs["pos"]
+                start_vel = obs["vel"]
+                pos_ws, vel_ws = self._warmstart_cubic_spline(
+                    start_pos=start_pos,
+                    start_vel=start_vel,
+                    goal_pos=goal_ws,
+                    horizon=15,#self.mppi.T,
+                    dt=self.mppi_dt,
+                )
+                self._last_warmstart_pos = pos_ws 
+
+                # feed warm-start to MPPI: force its initial means
+                # self.mppi.reset()
+                # self.mppi.U[:, :] = 0.0                           # zero action warm-start
+                self.mppi.X = torch.tensor(
+                    np.hstack([pos_ws, vel_ws]),
+                    dtype=torch.double, device=self.mppi.d
+                )
+                self.prev_goal = self.goal
 
             # ======================================================
             # 2. Build MPPI input state: (px,py,pz,vx,vy,vz)

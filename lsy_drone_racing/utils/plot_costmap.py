@@ -70,16 +70,16 @@ def plot_cost_slice_through_gate(gate_pos, gate_quat, grid_range=2.0, N=200):
     
     # Ellipse radii
     a = torch.tensor(1.2, device=device)  # long axis → through the gate
-    b = torch.tensor(0.3, device=device)  # narrow axis → the gate's plane
+    b = torch.tensor(0.15, device=device)  # narrow axis → the gate's plane
     
     # Elliptical distance
     ellipse_dist = (proj_n / a)**2 + (proj_t1 / b)**2 + (proj_t2 / b)**2
     
-    W_ellipse = 50.0  # tune weight
+    W_ellipse = 15.0  # tune weight
     c_ellipse = -W_ellipse / (ellipse_dist + 1e-6)
     
     # Position error
-    W_pos = torch.tensor([10.0, 10.0, 50.0], device=device, dtype=torch.float32)
+    W_pos = torch.tensor([10.0, 10.0, 10.0], device=device, dtype=torch.float32)
     c_pos = torch.sum(W_pos * (pos - goal_t) ** 2, dim=-1)
     
     # Velocity penalty
@@ -102,8 +102,7 @@ def plot_cost_slice_through_gate(gate_pos, gate_quat, grid_range=2.0, N=200):
     ax.set_title(f"MPPI Cost Slice Through Gate\nGate at [{gate_pos[0]:.2f}, {gate_pos[1]:.2f}, {gate_pos[2]:.2f}]")
     ax.grid(True, alpha=0.3)
     
-    # Mark the gate center
-    ax.plot(0, 0, 'r*', markersize=20, label='Gate Center', markeredgecolor='white', markeredgewidth=1)
+    # Gate center marker removed per request
     
     # Draw gate boundaries (vertical line at n=0, spanning ±0.3m vertically)
     gate_half_height = 0.3
@@ -183,16 +182,16 @@ def plot_cost_map_for_gate(gate_pos, gate_quat, grid_range=2.0, N=200):
     
     # Ellipse radii
     a = torch.tensor(1.2, device=device)  # long axis → through the gate
-    b = torch.tensor(0.3, device=device)  # narrow axis → the gate's plane
+    b = torch.tensor(0.1, device=device)  # narrow axis → the gate's plane
     
     # Elliptical distance
     ellipse_dist = (proj_n / a)**2 + (proj_t1 / b)**2 + (proj_t2 / b)**2
     
-    W_ellipse = 50.0  # tune weight
-    c_ellipse = -W_ellipse / (ellipse_dist + 1e-6)
+    W_ellipse = 0.25  # tune weight
+    c_ellipse = -W_ellipse / (ellipse_dist + 1e-6)**2
     
     # Position error
-    W_pos = torch.tensor([100.0, 100.0, 500.0], device=device, dtype=torch.float32)
+    W_pos = torch.tensor([10.0, 10.0, 10.0], device=device, dtype=torch.float32)
     c_pos = torch.sum(W_pos * (pos - goal_t) ** 2, dim=-1)
     
     # Velocity penalty
@@ -216,8 +215,18 @@ def plot_cost_map_for_gate(gate_pos, gate_quat, grid_range=2.0, N=200):
     plt.axis("equal")
     plt.grid(True, alpha=0.3)
     
-    # Mark the gate center
-    plt.plot(0, 0, 'r*', markersize=15, label='Gate Center')
+    # Gate center marker removed per request
+
+    # Visualize ellipse reward zone in gate plane: (proj_t1/b)^2 + (proj_t2/b)^2 = 1
+    # In the gate plane, proj_n = 0, so ellipse reduces to a circle with radius b
+    b_val = 0.1  # must match 'b' used above
+    theta = np.linspace(0, 2*np.pi, 200)
+    circle_t1 = b_val * np.cos(theta)
+    circle_t2 = b_val * np.sin(theta)
+    plt.plot(circle_t1, circle_t2, 'r--', linewidth=2, alpha=0.9, label='Gate-plane ellipse (radius b)')
+
+    # Indicate gate normal direction (perpendicular to plane)
+    plt.text(0.0, 0.0, '⊙ n', color='red', ha='left', va='bottom')
     plt.legend()
     
     return plt

@@ -106,6 +106,63 @@ def simulate(
             except Exception:
                 # drawing must never break the sim loop
                 pass
+                        # --- Draw warm-start spline if available ---
+            try:
+                warm = getattr(controller, "_last_warmstart_pos", None)
+                if warm is not None:
+                    warm = np.asarray(warm)
+                    if warm.ndim == 2 and warm.shape[1] == 3:
+                        draw_line(
+                            env,
+                            warm,
+                            rgba=np.array([0.0, 1.0, 0.0, 1.0]),  # green
+                            min_size=2.0,
+                            max_size=4.0,
+                        )
+            except Exception:
+                print("Could not draw warm-start trajectory.")
+                pass
+
+
+            # # --- Draw 20 lowest-cost MPPI trajectories as white lines ---
+            # try:
+            #     if hasattr(controller, "mppi"):
+            #         mppi = controller.mppi
+            #         states = getattr(mppi, "states", None)
+            #         costs  = getattr(mppi, "cost_total", None)
+
+            #         if states is not None and costs is not None:
+            #             import numpy as _np
+            #             costs = _np.asarray(costs)
+
+            #             # states shape: [1, K, T, nx]
+            #             rollouts = states[0].cpu().numpy()   # shape [K, T, nx]
+
+            #             K, T, nx = rollouts.shape
+            #             T_display = T  # number of steps to draw
+
+            #             # select best 20 trajectories
+            #             k = min(20, K)
+            #             best_idx = _np.argsort(costs)[:k]
+
+            #             for idx in best_idx:
+            #                 traj = rollouts[idx, :, :3]  # xyz only
+
+            #                 # draw each segment of this sampled trajectory
+            #                 for a, b in zip(traj[:-1], traj[1:]):
+            #                     env._env.draw_line(
+            #                         start=a,
+            #                         end=b,
+            #                         color=(1.0, 1.0, 1.0, 0.15),  # slightly transparent white
+            #                         width=1.0
+            #                     )
+
+            # except Exception as e:
+            #     print("Could not draw MPPI sample trajectories:", e)
+
+
+
+
             # Convert to a buffer that meets XLA's alginment restrictions to prevent warnings. See
             # https://github.com/jax-ml/jax/discussions/6055
             # traj_points = controller._des_pos_spline(np.linspace(0, controller._t_total, 200))
