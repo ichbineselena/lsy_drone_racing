@@ -224,6 +224,23 @@ class AttitudeMPC(Controller):
             self.mppi_dt = 0.05 #self._dt
             self.target_gate_idx = int(obs["target_gate"])
 
+            def gate_drag_cost(pos, gate_center, gate_normal,
+                k_normal=1.0, k_side=1.0, gamma=2.0):
+                # Vector from gate center to drone
+                d = pos - gate_center[None, :]
+
+                # Decompose
+                d_normal = torch.sum(d * gate_normal, dim=-1, keepdim=True)
+                d_side_vec = d - d_normal * gate_normal
+                d_side = torch.norm(d_side_vec, dim=-1, keepdim=True)
+
+                # Curved bowl-shaped attraction
+                cost_normal = k_normal * (d_normal ** 2)
+                cost_side   = k_side   * (d_side ** gamma)
+
+                return cost_normal + cost_side
+
+
             def dynamics(x, u):
                 px, py, pz, vx, vy, vz = torch.split(x, 1, dim=-1)
                 ax, ay, az = torch.split(u, 1, dim=-1)
@@ -238,11 +255,127 @@ class AttitudeMPC(Controller):
 
                 return torch.cat([px_next, py_next, pz_next, vx_next, vy_next, vz_next], dim=-1)
 
+            # def running_cost(x, u):
+            #     goal_t = torch.tensor(self.goal, device=x.device, dtype=x.dtype)
+            #     pos = x[..., :3]
+            #     vel = x[..., 3:6]
+            #     # gate quaternion → rotation matrix → normal
+            #     gate_quat = torch.tensor(obs["gates_quat"][self.target_gate_idx],
+            #                             device=x.device, dtype=x.dtype)
+
+            #     rot = R.from_quat(gate_quat.cpu().numpy())
+            #     gate_normal_np = rot.as_matrix()[:, 0]     # x-axis is forward direction
+            #     gate_normal = torch.tensor(gate_normal_np, device=x.device, dtype=x.dtype)
+
+            #     gate_normal = gate_normal / torch.norm(gate_normal)
+
+            #     # gate center
+            #     gate_center = torch.tensor(obs["gates_pos"][self.target_gate_idx],
+            #                             device=x.device, dtype=x.dtype)
+
+            #     # Build orthonormal basis: n, t1, t2
+            #     n = gate_normal
+            #     # pick arbitrary vector not parallel to n
+            #     tmp = torch.tensor([1.,0.,0.], device=x.device, dtype=x.dtype)
+            #     if torch.abs(torch.dot(tmp,n)) > 0.8:
+            #         tmp = torch.tensor([0.,1.,0.], device=x.device, dtype=x.dtype)
+
+            #     t1 = torch.cross(n, tmp)
+            #     t1 = t1 / torch.norm(t1)
+            #     t2 = torch.cross(n, t1)
+            #     t2 = t2 / torch.norm(t2)
+
+            #     d = pos - gate_center
+
+            #     # axis projections
+            #     proj_n  = torch.sum(d * n, dim=-1)
+            #     proj_t1 = torch.sum(d * t1, dim=-1)
+            #     proj_t2 = torch.sum(d * t2, dim=-1)
+
+            #     # ellipse radii
+            #     a = torch.tensor(1.2, device=x.device)   # long axis → through the gate
+            #     b = torch.tensor(0.15, device=x.device)   # narrow axis → the gate's plane
+
+            #     # elliptical distance
+            #     ellipse_dist = (proj_n / a)**2 + (proj_t1 / b)**2 + (proj_t2 / b)**2
+
+            #     W_ellipse = 40.0   # tune weight
+
+            #     c_ellipse = - W_ellipse / (ellipse_dist)
+
+            #     #c_ellipse = - W_ellipse / ellipse_dist
+            #     # --- 1. Position error ---
+            #     # Weight z (altitude) more heavily to ensure takeoff
+            #     W_pos = torch.tensor([10.0, 10.0, 50.0], device=x.device, dtype=x.dtype)
+            #     c_pos = torch.sum(W_pos * (pos - goal_t) ** 2, dim=-1)
+
+            #     # --- 2. Velocity penalty ---
+            #     # Encourage reaching goal with moderate speed
+            #     W_vel = torch.tensor([0.01, 0.01, 0.01], device=x.device, dtype=x.dtype)
+            #     c_vel = torch.sum(W_vel * vel ** 2, dim=-1)
+
+            #     # --- 3. Control effort penalty ---
+            #     # Penalize very aggressive control inputs
+            #     W_u = torch.tensor([0.01] * u.shape[-1], device=x.device, dtype=x.dtype)
+            #     c_u = torch.sum(W_u * u ** 2, dim=-1)
+
+
+            #     # --- Total cost ---
+            #     total_cost = c_pos + c_vel + c_u + c_ellipse
+            #     #print(f"[DEBUG] MPPI running cost components: pos {c_pos.mean().item():.3f}, ")
+
+            #     return total_cost
+
             def running_cost(x, u):
+                """
+                MPPI running cost using gate progress:
+                    J = ||p_{k+1} - p_gate||^2 - ||p_k - p_gate||^2
+                x: [batch, state_dim]
+                u: [batch, control_dim]
+                dynamics_func: a function (x, u, dt) → x_next
+                """
+
                 goal_t = torch.tensor(self.goal, device=x.device, dtype=x.dtype)
                 pos = x[..., :3]
                 vel = x[..., 3:6]
-                # gate quaternion → rotation matrix → normal
+
+                # Extract p_k
+                p_k = x[..., :3]
+
+                # Compute x_{k+1} using system dynamics
+                x_k1 = self.mppi._dynamics(x, u, self.mppi_dt)
+
+                # Extract p_{k+1}
+                p_k1 = x_k1[..., :3]
+
+                # Make gate_pos a proper tensor
+                p_gate = goal_t.to(x.device).to(x.dtype)
+
+                # ---- Gate-progress term (core) ----
+                dist_k  = torch.sum((p_k  - p_gate)**2, dim=-1)
+                dist_k1 = torch.sum((p_k1 - p_gate)**2, dim=-1)
+
+                # Negative when moving closer → good
+                c_gate = dist_k1 - dist_k
+
+                # ---- Optional smoothing penalties ----
+
+                # Velocity penalty
+                vel = x[..., 3:6]
+                W_vel = torch.tensor([0.01, 0.01, 0.01],
+                                    device=x.device, dtype=x.dtype)
+                c_vel = torch.sum(W_vel * vel**2, dim=-1)
+
+                # Control effort penalty
+                W_u = torch.tensor([0.001] * u.shape[-1],
+                                device=x.device, dtype=x.dtype)
+                c_u = torch.sum(W_u * u**2, dim=-1)
+
+                # Weight z (altitude) more heavily to ensure takeoff
+                W_pos = torch.tensor([10.0, 10.0, 20.0], device=x.device, dtype=x.dtype)
+                c_pos = torch.sum(W_pos * (pos - goal_t) ** 2, dim=-1)
+
+                 # gate quaternion → rotation matrix → normal
                 gate_quat = torch.tensor(obs["gates_quat"][self.target_gate_idx],
                                         device=x.device, dtype=x.dtype)
 
@@ -282,56 +415,17 @@ class AttitudeMPC(Controller):
                 # elliptical distance
                 ellipse_dist = (proj_n / a)**2 + (proj_t1 / b)**2 + (proj_t2 / b)**2
 
-                W_ellipse = 50.0   # tune weight
+                W_ellipse = 20.0   # tune weight
 
-                c_ellipse = - W_ellipse / ellipse_dist
-                # --- 1. Position error ---
-                # Weight z (altitude) more heavily to ensure takeoff
-                W_pos = torch.tensor([10.0, 10.0, 20.0], device=x.device, dtype=x.dtype)
-                c_pos = torch.sum(W_pos * (pos - goal_t) ** 2, dim=-1)
+                c_ellipse = - W_ellipse / (ellipse_dist)
+                print(f"[DEBUG] MPPI cost components: gate {15*c_gate.mean().item():.3f}, pos {c_pos.mean().item():.3f}, ellipse {c_ellipse.mean().item():.3f}")
 
-                # --- 2. Velocity penalty ---
-                # Encourage reaching goal with moderate speed
-                W_vel = torch.tensor([0.01, 0.01, 0.01], device=x.device, dtype=x.dtype)
-                c_vel = torch.sum(W_vel * vel ** 2, dim=-1)
-
-                # --- 3. Control effort penalty ---
-                # Penalize very aggressive control inputs
-                W_u = torch.tensor([0.01] * u.shape[-1], device=x.device, dtype=x.dtype)
-                c_u = torch.sum(W_u * u ** 2, dim=-1)
-
-                #  # --- 4. Gate alignment cost ---
-                # # Compute gate normal
-                # i = self.target_gate_idx
-                # rot = R.from_quat(obs["gates_quat"][i])
-                # det_euler = rot.as_euler("xyz")
-                # nom_pitch = self.gates_rpy[i]["rpy"][1]
-                # if abs(det_euler[1] - nom_pitch) < self._pitch_lock_thresh:
-                #     det_euler[1] = nom_pitch
-                #     rot = R.from_euler("xyz", det_euler)
-
-                # gate_normal = torch.tensor(rot.as_matrix()[:, 0], device=x.device, dtype=x.dtype)
-                # gate_normal = gate_normal / torch.norm(gate_normal)
-
-                # # Cosine similarity: dot(v, n) / (||v||*||n||)
-                # vel_norm = torch.norm(vel, dim=-1) + 1e-6
-                # dot_prod = torch.sum(vel * gate_normal, dim=-1)
-                # alignment_cost = 1.0 - dot_prod / vel_norm  # 0 if perfectly aligned, increases otherwise
-
-                # # Weight the alignment term
-                # W_align = 5.0
-                # c_align = W_align * alignment_cost
-
-                # --- Total cost ---
-                total_cost = c_pos + c_vel + c_u + c_ellipse
-                #print(f"[DEBUG] MPPI running cost components: pos {c_pos.mean().item():.3f}, ")
-
-                return total_cost
+                return 15*c_gate + c_vel + c_u + c_pos + c_ellipse
 
 
-            H = 35 #self._N
-            K = 200# samples; tune for performance
-            noise_sigma_matrix = 0.2 * torch.eye(3)
+            H = 30 #self._N
+            K = 5000# samples; tune for performance
+            noise_sigma_matrix = 0.3 * torch.eye(3)
 
             # instantiate MPPI solver
             # try:
