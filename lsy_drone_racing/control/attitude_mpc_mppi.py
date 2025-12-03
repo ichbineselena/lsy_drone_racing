@@ -372,7 +372,7 @@ class AttitudeMPC(Controller):
                 c_u = torch.sum(W_u * u**2, dim=-1)
 
                 # Weight z (altitude) more heavily to ensure takeoff
-                W_pos = torch.tensor([10.0, 10.0, 20.0], device=x.device, dtype=x.dtype)
+                W_pos = torch.tensor([10.0, 10.0, 50.0], device=x.device, dtype=x.dtype)
                 c_pos = torch.sum(W_pos * (pos - goal_t) ** 2, dim=-1)
 
                  # gate quaternion → rotation matrix → normal
@@ -418,18 +418,21 @@ class AttitudeMPC(Controller):
                 W_ellipse = 20.0   # tune weight
 
                 c_ellipse = - W_ellipse / (ellipse_dist)
-                print(f"[DEBUG] MPPI cost components: gate {15*c_gate.mean().item():.3f}, pos {c_pos.mean().item():.3f}, ellipse {c_ellipse.mean().item():.3f}")
+                print(f"[DEBUG] MPPI cost components: gate {15*c_gate.min().item():.3f}, pos {c_pos.min().item():.3f}, ellipse {c_ellipse.min().item():.3f}")
 
-                return 15*c_gate + c_vel + c_u + c_pos + c_ellipse
+                return 15*c_gate + 0*c_vel + 0*c_u + c_pos + c_ellipse
 
-
-            H = 30 #self._N
-            K = 5000# samples; tune for performance
-            noise_sigma_matrix = 0.3 * torch.eye(3)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            H = 25 #self._N
+            K = 10000# samples; tune for performance
+            noise_sigma_matrix = torch.tensor(
+                    [0.5, 0.5, 0.25],
+                    dtype=torch.double,
+                    device="cpu"
+                ) * torch.eye(3)
 
             # instantiate MPPI solver
             # try:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             noise_sigma = torch.tensor(
                 noise_sigma_matrix,
                 dtype=torch.double,
@@ -444,8 +447,8 @@ class AttitudeMPC(Controller):
                 num_samples=K,
                 horizon=H,
                 lambda_=1.0,
-                u_min=torch.tensor([-2.0], dtype=torch.double, device=device), #[-0.5, -0.5, -0.5]
-                u_max=torch.tensor([2.0], dtype=torch.double, device=device), #[0.5, 0.5, 0.5]
+                u_min=torch.tensor([-1.5], dtype=torch.double, device=device), #[-0.5, -0.5, -0.5]
+                u_max=torch.tensor([1.5], dtype=torch.double, device=device), #[0.5, 0.5, 0.5]
                 device=device,
             )
             print("[AttitudeMPC] Using PyTorch MPPI as high-level trajectory planner.")
@@ -482,6 +485,7 @@ class AttitudeMPC(Controller):
             # mid1 = bc_pos + 0.33 * (goal_pos - bc_pos) 
             # mid2 = bc_pos + 0.5 * (goal_pos - bc_pos) 
             # mid3 = bc_pos + 0.66 * (goal_pos - bc_pos)
+            goal_pos = goal_pos + [0,0,0.1]
 
             xs = np.vstack([bc_pos, goal_pos]) #mid1, mid2, mid3,
 
@@ -537,7 +541,7 @@ class AttitudeMPC(Controller):
                 gate_quat = obs["gates_quat"][target_gate_idx]
                 rot = R.from_quat(gate_quat)
                 forward = rot.as_matrix()[:, 0]
-                goal_ws = self.goal + 0.1 * forward    # warm-start goal
+                goal_ws = self.goal + 0.05 * forward    # warm-start goal
 
                 #self.goal = goal_ws
 
@@ -630,29 +634,29 @@ class AttitudeMPC(Controller):
 
 
         # Map MPPI velocity plan -> per-step thrust reference using finite differences
-        try:
-            vel_plan = np.asarray(ref.get("vel", ref["vel"]))
-            if vel_plan.ndim == 2 and vel_plan.shape[0] == self._N and vel_plan.shape[1] >= 3:
-                a_z = np.zeros((self._N,))
-                curr_vz = float(obs["vel"][2])
-                a_z[0] = (float(vel_plan[0, 2]) - curr_vz) / max(self._dt, 1e-8)
-                for k in range(1, self._N):
-                    a_z[k] = (float(vel_plan[k, 2]) - float(vel_plan[k - 1, 2])) / max(self._dt, 1e-8)
+        # try:
+        #     vel_plan = np.asarray(ref.get("vel", ref["vel"]))
+        #     if vel_plan.ndim == 2 and vel_plan.shape[0] == self._N and vel_plan.shape[1] >= 3:
+        #         a_z = np.zeros((self._N,))
+        #         curr_vz = float(obs["vel"][2])
+        #         a_z[0] = (float(vel_plan[0, 2]) - curr_vz) / max(self._dt, 1e-8)
+        #         for k in range(1, self._N):
+        #             a_z[k] = (float(vel_plan[k, 2]) - float(vel_plan[k - 1, 2])) / max(self._dt, 1e-8)
 
-                mass = float(self.drone_params.get("mass", 1.0))
-                g_z = float(self.drone_params.get("gravity_vec", [0.0, 0.0, -9.81])[-1])
-                thrusts = mass * (-g_z + a_z)
+        #         mass = float(self.drone_params.get("mass", 1.0))
+        #         g_z = float(self.drone_params.get("gravity_vec", [0.0, 0.0, -9.81])[-1])
+        #         thrusts = mass * (-g_z + a_z)
 
-                tmin = self.drone_params.get("thrust_min", None)
-                tmax = self.drone_params.get("thrust_max", None)
-                if tmin is not None and tmax is not None:
-                    thrusts = np.clip(thrusts, tmin * 4, tmax * 4)
+        #         tmin = self.drone_params.get("thrust_min", None)
+        #         tmax = self.drone_params.get("thrust_max", None)
+        #         if tmin is not None and tmax is not None:
+        #             thrusts = np.clip(thrusts, tmin * 4, tmax * 4)
 
-                yref[:, 15] = thrusts
-            else:
-                yref[:, 15] = self.drone_params["mass"] * -self.drone_params["gravity_vec"][-1]
-        except Exception:
-            yref[:, 15] = self.drone_params["mass"] * -self.drone_params["gravity_vec"][-1]
+        #         yref[:, 15] = thrusts
+        #     else:
+        #         yref[:, 15] = self.drone_params["mass"] * -self.drone_params["gravity_vec"][-1]
+        # except Exception:
+        yref[:, 15] = self.drone_params["mass"] * -self.drone_params["gravity_vec"][-1]
 
         for j in range(self._N):
             self._acados_ocp_solver.set(j, "yref", yref[j])
