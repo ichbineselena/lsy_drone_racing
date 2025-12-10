@@ -8,13 +8,14 @@ from mujoco import mjx
 from hydrax import ROOT
 from hydrax.task_base import Task
 
+from utils.jax_euler_dynamics import jax_euler_dynamics, jax_euler_dynamics_statevec, vmap_jax_euler_dynamics_statevec
 
 class CubeRotation(Task):
     """Cube rotation with the LEAP hand."""
 
     def __init__(self) -> None:
-        """Load the MuJoCo model and set task parameters."""
-        mj_model = mujoco.MjModel.from_xml_path(ROOT + "/models/cube/scene.xml")
+        """Load the dynamics model and set task parameters."""
+        model = jax_euler_dynamics()
         super().__init__(
             mj_model,
             trace_sites=["cube_center", "if_tip", "mf_tip", "rf_tip", "th_tip"],
