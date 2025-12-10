@@ -409,18 +409,18 @@ class AttitudeMPC(Controller):
                 proj_t2 = torch.sum(d * t2, dim=-1)
 
                 # ellipse radii
-                a = torch.tensor(1.2, device=x.device)   # long axis → through the gate
-                b = torch.tensor(0.15, device=x.device)   # narrow axis → the gate's plane
+                a = torch.tensor(1.0, device=x.device)   # long axis → through the gate
+                b = torch.tensor(0.12, device=x.device)   # narrow axis → the gate's plane
 
                 # elliptical distance
                 ellipse_dist = (proj_n / a)**2 + (proj_t1 / b)**2 + (proj_t2 / b)**2
 
-                W_ellipse = 20.0   # tune weight
+                W_ellipse = 0.0   # tune weight
 
                 c_ellipse = - W_ellipse / (ellipse_dist)
-                print(f"[DEBUG] MPPI cost components: gate {15*c_gate.min().item():.3f}, pos {c_pos.min().item():.3f}, ellipse {c_ellipse.min().item():.3f}")
+                print(f"[DEBUG] MPPI cost components: gate {100*c_gate.mean().item():.3f}, pos {c_pos.mean().item():.3f}, ellipse {c_ellipse.mean().item():.3f}")
 
-                return 15*c_gate + 0*c_vel + 0*c_u + c_pos + c_ellipse
+                return 100*c_gate + c_vel + c_u + c_pos + c_ellipse
 
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             H = 25 #self._N
@@ -533,38 +533,40 @@ class AttitudeMPC(Controller):
             # ======================================================
             target_gate_idx = int(obs["target_gate"])
             self.goal = obs["gates_pos"][target_gate_idx]
-            if self.goal[0] != self.prev_goal[0]:
+            
+            # Regenerate warm-start every timestep for current position
+            goal_changed = self.goal[0] != self.prev_goal[0]
+            if goal_changed:
                 print(f"[DEBUG] MPPI goal updated to gate index {target_gate_idx} "
                     f"at position {self.goal}")
-                
-                # small forward offset through the gate
-                gate_quat = obs["gates_quat"][target_gate_idx]
-                rot = R.from_quat(gate_quat)
-                forward = rot.as_matrix()[:, 0]
-                goal_ws = self.goal + 0.05 * forward    # warm-start goal
+                self.prev_goal = self.goal
+            
+            # small forward offset through the gate
+            gate_quat = obs["gates_quat"][target_gate_idx]
+            rot = R.from_quat(gate_quat)
+            forward = rot.as_matrix()[:, 0]
+            goal_ws = self.goal + 0.05 * forward    # warm-start goal
 
-                #self.goal = goal_ws
+            # build warm-start from current (p,v) → goal_ws EVERY timestep
+            start_pos = obs["pos"]
+            start_vel = obs["vel"]
+            pos_ws, vel_ws = self._warmstart_cubic_spline(
+                start_pos=start_pos,
+                start_vel=start_vel,
+                goal_pos=goal_ws,
+                horizon=self._N + 10,  # Use MPC horizon for consistency
+                dt=self._dt,  # Use MPC dt for consistency
+            )
+            self._last_warmstart_pos = pos_ws 
+            self._last_warmstart_vel = vel_ws  # Store for later use
 
-                # build warm-start from (p,v) → goal_ws
-                start_pos = obs["pos"]
-                start_vel = obs["vel"]
-                pos_ws, vel_ws = self._warmstart_cubic_spline(
-                    start_pos=start_pos,
-                    start_vel=start_vel,
-                    goal_pos=goal_ws,
-                    horizon=15,#self.mppi.T,
-                    dt=self.mppi_dt,
-                )
-                self._last_warmstart_pos = pos_ws 
-
+            # Only reset MPPI state on goal change to avoid disrupting optimization
+            if goal_changed:
                 # feed warm-start to MPPI: force its initial means
-                # self.mppi.reset()
-                # self.mppi.U[:, :] = 0.0                           # zero action warm-start
                 self.mppi.X = torch.tensor(
                     np.hstack([pos_ws, vel_ws]),
                     dtype=torch.double, device=self.mppi.d
                 )
-                self.prev_goal = self.goal
 
             # ======================================================
             # 2. Build MPPI input state: (px,py,pz,vx,vy,vz)
@@ -598,11 +600,75 @@ class AttitudeMPC(Controller):
             x_traj_np = np.stack(xs, axis=0)  # (N+1, nx)
 
             # ======================================================
-            # 5. Extract planned pos/vel/yaw for MPC reference
+            # 5. Evaluate MPPI trajectory cost vs warm-start spline cost
             # ======================================================
-            pos_plan = x_traj_np[1:, 0:3]
-            vel_plan = x_traj_np[1:, 3:6]
-            yaw_plan = np.zeros((pos_plan.shape[0],))
+            # Compute MPPI best trajectory cost
+            mppi_best_cost = float('inf')
+            if hasattr(self.mppi, 'cost_total') and self.mppi.cost_total is not None:
+                costs = self.mppi.cost_total.cpu().numpy()
+                mppi_best_cost = np.min(costs)
+                print(f"[DEBUG] MPPI best cost: {mppi_best_cost:.3f}")
+
+            # Compute warm-start spline cost (if available)
+            use_warmstart = False
+            if hasattr(self, '_last_warmstart_pos') and hasattr(self, '_last_warmstart_vel'):
+                # The warm-start has N+1 points (including initial position)
+                # We need points 1:N+1 (excluding the current position at index 0)
+                ws_pos = self._last_warmstart_pos[1:self._N+1]  # Shape: (N, 3)
+                ws_vel = self._last_warmstart_vel[1:self._N+1]  # Shape: (N, 3)
+                
+                # Compute cost for warm-start using PROGRESSIVE metric like MPPI
+                ws_cost = 0.0
+                goal_t = torch.tensor(self.goal, device=x0.device, dtype=x0.dtype)
+                
+                # Start from current position
+                prev_pos = torch.tensor(obs["pos"], device=x0.device, dtype=x0.dtype)
+                
+                for k in range(len(ws_pos)):
+                    pos_k = torch.tensor(ws_pos[k], device=x0.device, dtype=x0.dtype)
+                    vel_k = torch.tensor(ws_vel[k], device=x0.device, dtype=x0.dtype)
+                    
+                    # Progressive gate cost (like MPPI's c_gate)
+                    dist_prev = torch.sum((prev_pos - goal_t) ** 2)
+                    dist_k = torch.sum((pos_k - goal_t) ** 2)
+                    c_gate = 20.0 * (dist_k - dist_prev).item()  # Match MPPI weight
+                    
+                    # Position cost
+                    W_pos = torch.tensor([10.0, 10.0, 20.0], device=x0.device, dtype=x0.dtype)
+                    c_pos = torch.sum(W_pos * (pos_k - goal_t) ** 2).item()
+                    
+                    # Velocity penalty
+                    W_vel = torch.tensor([0.01, 0.01, 0.01], device=x0.device, dtype=x0.dtype)
+                    c_vel = torch.sum(W_vel * vel_k ** 2).item()
+                    
+                    ws_cost += c_gate + c_pos + c_vel
+                    prev_pos = pos_k
+                
+                print(f"[DEBUG] Warm-start spline cost: {ws_cost:.3f}")
+                
+                # Prefer MPPI unless warm-start is significantly better
+                cost_margin = 1.5 # Use warm-start only if 15% better
+                if ws_cost < mppi_best_cost * cost_margin:
+                    use_warmstart = True
+                    print(f"[DEBUG] Using warm-start trajectory (cost {ws_cost:.3f} < {mppi_best_cost * cost_margin:.3f})")
+                else:
+                    print(f"[DEBUG] Using MPPI trajectory (ws_cost {ws_cost:.3f} >= threshold {mppi_best_cost * cost_margin:.3f})")
+
+            # ======================================================
+            # 6. Extract planned pos/vel/yaw for MPC reference
+            # ======================================================
+            if use_warmstart:
+                # Use warm-start spline trajectory
+                pos_plan = ws_pos  # Already shaped (N, 3)
+                vel_plan = ws_vel  # Already shaped (N, 3)
+                yaw_plan = np.zeros((len(pos_plan),))
+                self._last_planned_pos = pos_plan[:]
+            else:
+                # Use MPPI trajectory
+                pos_plan = x_traj_np[1:, 0:3]  # Shape: (N, 3)
+                vel_plan = x_traj_np[1:, 3:6]  # Shape: (N, 3)
+                yaw_plan = np.zeros((pos_plan.shape[0],))
+                self._last_planned_pos = pos_plan[:]
 
             ref = {
                 "pos": pos_plan,
@@ -610,8 +676,7 @@ class AttitudeMPC(Controller):
                 "yaw": yaw_plan,
             }
 
-            self._last_planned_pos = pos_plan[:]
-            print(f"[DEBUG] MPPI planned pos (first few): {pos_plan[:3]}")
+            print(f"[DEBUG] {'Warm-start' if use_warmstart else 'MPPI'} planned pos (first few): {pos_plan[:3]}")
 
         else:
             # ======================================================
@@ -664,13 +729,19 @@ class AttitudeMPC(Controller):
         # Setting final state reference
         yref_e = np.zeros((self._ny_e))
         t_terminal = t_now + self._N * self._dt
-        if getattr(self, "_use_pytorch_mppi", False) and 'x_traj_np' in locals():
-            ref_e_pos = x_traj_np[min(self._N, x_traj_np.shape[0]-1), 0:3]
-            ref_e_vel = x_traj_np[min(self._N, x_traj_np.shape[0]-1), 3:6]
-            ref_e_yaw = 0.0
-            yref_e[0:3] = ref_e_pos
-            yref_e[5] = ref_e_yaw
-            yref_e[6:9] = ref_e_vel
+        if getattr(self, "_use_pytorch_mppi", False):
+            # Use the same trajectory source as the MPC reference
+            if 'pos_plan' in locals() and 'vel_plan' in locals():
+                ref_e_pos = pos_plan[-1] if len(pos_plan) > 0 else obs["pos"]
+                ref_e_vel = vel_plan[-1] if len(vel_plan) > 0 else obs["vel"]
+                ref_e_yaw = 0.0
+                yref_e[0:3] = ref_e_pos
+                yref_e[5] = ref_e_yaw
+                yref_e[6:9] = ref_e_vel
+            else:
+                yref_e[0:3] = self.goal
+                yref_e[5] = 0.0
+                yref_e[6:9] = [0, 0, 0]
         else:
             ref_e = self._trajectory_builder.get_horizon(t_terminal, 1, self._dt)
             yref_e[0:3] = ref_e["pos"][0]

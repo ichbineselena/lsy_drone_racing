@@ -75,11 +75,12 @@ def plot_cost_slice_through_gate(gate_pos, gate_quat, grid_range=2.0, N=200):
     # Elliptical distance
     ellipse_dist = (proj_n / a)**2 + (proj_t1 / b)**2 + (proj_t2 / b)**2
     
-    W_ellipse = 15.0  # tune weight
-    c_ellipse = -W_ellipse / (ellipse_dist + 1e-6)
+    W_ellipse = 40.0  # tune weight
+    c_ellipse = - W_ellipse / (1e-6 + ellipse_dist)
+
     
     # Position error
-    W_pos = torch.tensor([10.0, 10.0, 10.0], device=device, dtype=torch.float32)
+    W_pos = torch.tensor([5.0, 5.0, 10.0], device=device, dtype=torch.float32)
     c_pos = torch.sum(W_pos * (pos - goal_t) ** 2, dim=-1)
     
     # Velocity penalty
@@ -187,11 +188,11 @@ def plot_cost_map_for_gate(gate_pos, gate_quat, grid_range=2.0, N=200):
     # Elliptical distance
     ellipse_dist = (proj_n / a)**2 + (proj_t1 / b)**2 + (proj_t2 / b)**2
     
-    W_ellipse = 0.25  # tune weight
-    c_ellipse = -W_ellipse / (ellipse_dist + 1e-6)**2
+    W_ellipse = 40.0  # tune weight
+    c_ellipse = - W_ellipse / (0.5 + ellipse_dist)
     
     # Position error
-    W_pos = torch.tensor([10.0, 10.0, 10.0], device=device, dtype=torch.float32)
+    W_pos = torch.tensor([10.0, 10.0, 50.0], device=device, dtype=torch.float32)
     c_pos = torch.sum(W_pos * (pos - goal_t) ** 2, dim=-1)
     
     # Velocity penalty
