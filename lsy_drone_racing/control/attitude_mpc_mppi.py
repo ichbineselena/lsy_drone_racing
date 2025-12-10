@@ -7,7 +7,7 @@ The waypoints are generated using cubic spline interpolation from a set of prede
 Note that the trajectory uses pre-defined waypoints instead of dynamically generating a good path.
 """
 
-from __future__ import annotations  # Python 3.10 type hints
+from __future__ import annotations  # Python 3.10 type hints 
 
 from typing import TYPE_CHECKING, Optional
 
@@ -20,7 +20,7 @@ from drone_models.utils.rotation import ang_vel2rpy_rates
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
 import torch
-# from pytorch_mppi import MPPI, smooth_mppi as smppi
+# from pytorch_mppi import MPPI, smooth_mppi as smppi. 
 import pytorch_mppi
 from lsy_drone_racing.control import Controller
 from lsy_drone_racing.control.trajectory_builders import SplineBuilder, MPPIBuilder, TrajectoryBuilder
@@ -221,7 +221,7 @@ class AttitudeMPC(Controller):
             # create a simple MPPI using a pos/vel kinematic model (6D state, 3D accel control)
             self.goal = obs["gates_pos"][obs["target_gate"]]
             self.gates = obs["gates_pos"]
-            self.mppi_dt = 0.05 #self._dt
+            self.mppi_dt = 0.1 #self._dt
             self.target_gate_idx = int(obs["target_gate"])
 
             def gate_drag_cost(pos, gate_center, gate_normal,
@@ -372,7 +372,7 @@ class AttitudeMPC(Controller):
                 c_u = torch.sum(W_u * u**2, dim=-1)
 
                 # Weight z (altitude) more heavily to ensure takeoff
-                W_pos = torch.tensor([10.0, 10.0, 50.0], device=x.device, dtype=x.dtype)
+                W_pos = torch.tensor([10.0, 10.0, 20.0], device=x.device, dtype=x.dtype)
                 c_pos = torch.sum(W_pos * (pos - goal_t) ** 2, dim=-1)
 
                  # gate quaternion → rotation matrix → normal
@@ -415,16 +415,16 @@ class AttitudeMPC(Controller):
                 # elliptical distance
                 ellipse_dist = (proj_n / a)**2 + (proj_t1 / b)**2 + (proj_t2 / b)**2
 
-                W_ellipse = 0.0   # tune weight
+                W_ellipse = 10.0   # tune weight
 
                 c_ellipse = - W_ellipse / (ellipse_dist)
-                print(f"[DEBUG] MPPI cost components: gate {100*c_gate.mean().item():.3f}, pos {c_pos.mean().item():.3f}, ellipse {c_ellipse.mean().item():.3f}")
+                print(f"[DEBUG] MPPI cost components: gate {20*c_gate.mean().item():.3f}, pos {c_pos.mean().item():.3f}, ellipse {c_ellipse.mean().item():.3f}")
 
-                return 100*c_gate + c_vel + c_u + c_pos + c_ellipse
+                return 20*c_gate + c_vel + c_u + c_pos + c_ellipse
 
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            H = 25 #self._N
-            K = 10000# samples; tune for performance
+            H = 10 #self._N
+            K = 8000# samples; tune for performance
             noise_sigma_matrix = torch.tensor(
                     [0.5, 0.5, 0.25],
                     dtype=torch.double,
@@ -447,8 +447,8 @@ class AttitudeMPC(Controller):
                 num_samples=K,
                 horizon=H,
                 lambda_=1.0,
-                u_min=torch.tensor([-1.5], dtype=torch.double, device=device), #[-0.5, -0.5, -0.5]
-                u_max=torch.tensor([1.5], dtype=torch.double, device=device), #[0.5, 0.5, 0.5]
+                u_min=torch.tensor([-1.75], dtype=torch.double, device=device), #[-0.5, -0.5, -0.5]
+                u_max=torch.tensor([1.75], dtype=torch.double, device=device), #[0.5, 0.5, 0.5]
                 device=device,
             )
             print("[AttitudeMPC] Using PyTorch MPPI as high-level trajectory planner.")
@@ -468,6 +468,41 @@ class AttitudeMPC(Controller):
         self._tick_max = MAX_STEPS_PER_SEGMENT - 1 - self._N
         self._config = config
         self._finished = False
+
+    def _interpolate_trajectory(self, pos_traj, vel_traj, target_length):
+        """
+        Interpolate a trajectory to a target length using cubic spline.
+        
+        Args:
+            pos_traj: Position trajectory of shape (N, 3)
+            vel_traj: Velocity trajectory of shape (N, 3)
+            target_length: Target number of points
+            
+        Returns:
+            Interpolated pos_traj and vel_traj of shape (target_length, 3)
+        """
+        if len(pos_traj) == target_length:
+            return pos_traj, vel_traj
+        
+        # Original time points
+        t_orig = np.linspace(0, 1, len(pos_traj))
+        # Target time points
+        t_interp = np.linspace(0, 1, target_length)
+        
+        # Interpolate each dimension separately using cubic splines
+        pos_interp = np.zeros((target_length, 3))
+        vel_interp = np.zeros((target_length, 3))
+        
+        for dim in range(3):
+            # Cubic spline for position
+            cs_pos = CubicSpline(t_orig, pos_traj[:, dim], bc_type='natural')
+            pos_interp[:, dim] = cs_pos(t_interp)
+            
+            # Cubic spline for velocity
+            cs_vel = CubicSpline(t_orig, vel_traj[:, dim], bc_type='natural')
+            vel_interp[:, dim] = cs_vel(t_interp)
+        
+        return pos_interp, vel_interp
 
     def _warmstart_cubic_spline(self, start_pos, start_vel, goal_pos, horizon, dt):
             """
@@ -545,7 +580,7 @@ class AttitudeMPC(Controller):
             gate_quat = obs["gates_quat"][target_gate_idx]
             rot = R.from_quat(gate_quat)
             forward = rot.as_matrix()[:, 0]
-            goal_ws = self.goal + 0.05 * forward    # warm-start goal
+            goal_ws = self.goal + 0 * forward    # warm-start goal
 
             # build warm-start from current (p,v) → goal_ws EVERY timestep
             start_pos = obs["pos"]
@@ -582,7 +617,7 @@ class AttitudeMPC(Controller):
             # ======================================================
             with torch.no_grad():
                 u0 = self.mppi.command(x0)  # first optimal action
-                print("Opt u0: ", u0)
+                # print("Opt u0: ", u0)
 
             # ======================================================
             # 4. Roll out predicted future states
@@ -607,7 +642,7 @@ class AttitudeMPC(Controller):
             if hasattr(self.mppi, 'cost_total') and self.mppi.cost_total is not None:
                 costs = self.mppi.cost_total.cpu().numpy()
                 mppi_best_cost = np.min(costs)
-                print(f"[DEBUG] MPPI best cost: {mppi_best_cost:.3f}")
+                #print(f"[DEBUG] MPPI best cost: {mppi_best_cost:.3f}")
 
             # Compute warm-start spline cost (if available)
             use_warmstart = False
@@ -634,7 +669,7 @@ class AttitudeMPC(Controller):
                     c_gate = 20.0 * (dist_k - dist_prev).item()  # Match MPPI weight
                     
                     # Position cost
-                    W_pos = torch.tensor([10.0, 10.0, 20.0], device=x0.device, dtype=x0.dtype)
+                    W_pos = torch.tensor([10.0, 10.0, 30.0], device=x0.device, dtype=x0.dtype)
                     c_pos = torch.sum(W_pos * (pos_k - goal_t) ** 2).item()
                     
                     # Velocity penalty
@@ -644,10 +679,10 @@ class AttitudeMPC(Controller):
                     ws_cost += c_gate + c_pos + c_vel
                     prev_pos = pos_k
                 
-                print(f"[DEBUG] Warm-start spline cost: {ws_cost:.3f}")
+                #print(f"[DEBUG] Warm-start spline cost: {ws_cost:.3f}")
                 
                 # Prefer MPPI unless warm-start is significantly better
-                cost_margin = 1.5 # Use warm-start only if 15% better
+                cost_margin = 1.3 # Use warm-start only if 15% better
                 if ws_cost < mppi_best_cost * cost_margin:
                     use_warmstart = True
                     print(f"[DEBUG] Using warm-start trajectory (cost {ws_cost:.3f} < {mppi_best_cost * cost_margin:.3f})")
@@ -661,14 +696,18 @@ class AttitudeMPC(Controller):
                 # Use warm-start spline trajectory
                 pos_plan = ws_pos  # Already shaped (N, 3)
                 vel_plan = ws_vel  # Already shaped (N, 3)
-                yaw_plan = np.zeros((len(pos_plan),))
-                self._last_planned_pos = pos_plan[:]
             else:
                 # Use MPPI trajectory
-                pos_plan = x_traj_np[1:, 0:3]  # Shape: (N, 3)
-                vel_plan = x_traj_np[1:, 3:6]  # Shape: (N, 3)
-                yaw_plan = np.zeros((pos_plan.shape[0],))
-                self._last_planned_pos = pos_plan[:]
+                pos_plan = x_traj_np[1:, 0:3]  # Shape: (N_mppi, 3)
+                vel_plan = x_traj_np[1:, 3:6]  # Shape: (N_mppi, 3)
+            
+            # Interpolate trajectory to match MPC horizon if needed
+            if len(pos_plan) != self._N:
+                # print(f"[DEBUG] Interpolating trajectory from {len(pos_plan)} to {self._N} points")
+                pos_plan, vel_plan = self._interpolate_trajectory(pos_plan, vel_plan, self._N)
+            
+            yaw_plan = np.zeros((len(pos_plan),))
+            self._last_planned_pos = pos_plan[:]
 
             ref = {
                 "pos": pos_plan,
@@ -699,29 +738,29 @@ class AttitudeMPC(Controller):
 
 
         # Map MPPI velocity plan -> per-step thrust reference using finite differences
-        # try:
-        #     vel_plan = np.asarray(ref.get("vel", ref["vel"]))
-        #     if vel_plan.ndim == 2 and vel_plan.shape[0] == self._N and vel_plan.shape[1] >= 3:
-        #         a_z = np.zeros((self._N,))
-        #         curr_vz = float(obs["vel"][2])
-        #         a_z[0] = (float(vel_plan[0, 2]) - curr_vz) / max(self._dt, 1e-8)
-        #         for k in range(1, self._N):
-        #             a_z[k] = (float(vel_plan[k, 2]) - float(vel_plan[k - 1, 2])) / max(self._dt, 1e-8)
+        try:
+            vel_plan = np.asarray(ref.get("vel", ref["vel"]))
+            if vel_plan.ndim == 2 and vel_plan.shape[0] == self._N and vel_plan.shape[1] >= 3:
+                a_z = np.zeros((self._N,))
+                curr_vz = float(obs["vel"][2])
+                a_z[0] = (float(vel_plan[0, 2]) - curr_vz) / max(self._dt, 1e-8)
+                for k in range(1, self._N):
+                    a_z[k] = (float(vel_plan[k, 2]) - float(vel_plan[k - 1, 2])) / max(self._dt, 1e-8)
 
-        #         mass = float(self.drone_params.get("mass", 1.0))
-        #         g_z = float(self.drone_params.get("gravity_vec", [0.0, 0.0, -9.81])[-1])
-        #         thrusts = mass * (-g_z + a_z)
+                mass = float(self.drone_params.get("mass", 1.0))
+                g_z = float(self.drone_params.get("gravity_vec", [0.0, 0.0, -9.81])[-1])
+                thrusts = mass * (-g_z + a_z)
 
-        #         tmin = self.drone_params.get("thrust_min", None)
-        #         tmax = self.drone_params.get("thrust_max", None)
-        #         if tmin is not None and tmax is not None:
-        #             thrusts = np.clip(thrusts, tmin * 4, tmax * 4)
-
-        #         yref[:, 15] = thrusts
-        #     else:
-        #         yref[:, 15] = self.drone_params["mass"] * -self.drone_params["gravity_vec"][-1]
-        # except Exception:
-        yref[:, 15] = self.drone_params["mass"] * -self.drone_params["gravity_vec"][-1]
+                tmin = self.drone_params.get("thrust_min", None)
+                tmax = self.drone_params.get("thrust_max", None)
+                if tmin is not None and tmax is not None:
+                    thrusts = np.clip(thrusts, tmin * 4, tmax * 4)
+                print(f"[DEBUG] Computed thrust refs (first few): {thrusts[:3]}")
+                yref[:, 15] = thrusts
+            else:
+                yref[:, 15] = self.drone_params["mass"] * -self.drone_params["gravity_vec"][-1]
+        except Exception:
+            yref[:, 15] = self.drone_params["mass"] * -self.drone_params["gravity_vec"][-1]
 
         for j in range(self._N):
             self._acados_ocp_solver.set(j, "yref", yref[j])
