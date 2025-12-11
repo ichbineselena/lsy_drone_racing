@@ -48,10 +48,10 @@ class AttitudeMPPIController(Controller):
         self._config = config
 
         # MPPI hyperparameters - optimized for robust trajectory optimization
-        self.mppi_horizon = 25  # Planning horizon steps (increased for multi-gate foresight)
+        self.mppi_horizon = 25  # Planning horizon steps (proven stable for 4-gate success)
         self.mppi_dt = self._dt * 2  # 0.04s time discretization
-        self.num_samples = 6000  # Increased for better optimization quality
-        self.lambda_weight = 10.0  # Temperature parameter
+        self.num_samples = 6000  # Stable optimization quality
+        self.lambda_weight = 9.5  # Temperature parameter tuned for improved transitions
         
         # Gate geometry constants
         self.gate_opening = 0.30  # 30cm square opening
@@ -106,7 +106,7 @@ class AttitudeMPPIController(Controller):
         # Simplified cost weights - balanced aggressive for 4-gate success
         self.cost_weights = {
               "position": torch.tensor([20.0, 20.0, 16.0], device=self.device, dtype=self.dtype),  # Breakthrough config
-              "velocity": torch.tensor([0.05, 0.05, 0.15], device=self.device, dtype=self.dtype),  # Breakthrough config
+              "velocity": torch.tensor([0.040, 0.040, 0.125], device=self.device, dtype=self.dtype),  # Stabilized without losing too much speed
             "attitude": torch.tensor([1.5, 1.5, 0.2], device=self.device, dtype=self.dtype),  # Lower for agility
             "z_floor": 2000.0,  # Strong penalty for ground collision (Z < 0.03m)
         }
@@ -190,18 +190,73 @@ class AttitudeMPPIController(Controller):
         rpy = state[..., 3:6]
         vel = state[..., 6:9]
 
-        # Target position (gate center)
-        goal_pos = torch.tensor(self.goal, dtype=self.dtype, device=self.device)
-
         # 1. Position tracking - MAIN OBJECTIVE with distance-adaptive scaling
-        pos_error = pos - goal_pos
+        goal_t = torch.tensor(self.goal, dtype=self.dtype, device=self.device)
+        pos_error = pos - goal_t
         dist_to_goal = torch.norm(pos_error, dim=-1)
-        # 2x position cost when within 0.5m (breakthrough config)
-        proximity_scale = torch.where(dist_to_goal < 0.5, 2.0, 1.0)
+        # 2.2x position cost when within 0.4m for tighter precision at gate
+        proximity_scale = torch.where(dist_to_goal < 0.4, 2.2, 1.0)
         c_pos = proximity_scale * torch.sum(self.cost_weights["position"] * pos_error ** 2, dim=-1)
+
+        # 1a. Attraction to gate opening and obstacle avoidance for gate frames
+        # Transform position into gate-local coordinates: [x_normal, y_plane, z_plane]
+        gate_center_np = self.gates_pos[self.target_gate_idx]
+        gate_quat_np = self.gates_quat[self.target_gate_idx]
+        gate_R_np = R.from_quat(gate_quat_np).as_matrix()
+        gate_R = torch.tensor(gate_R_np, dtype=self.dtype, device=self.device)
+        gate_center = torch.tensor(gate_center_np, dtype=self.dtype, device=self.device)
+        # local coordinates
+        rel = pos - gate_center
+        x_n = torch.sum(rel * gate_R[:, 0], dim=-1)
+        y_p = torch.sum(rel * gate_R[:, 1], dim=-1)
+        z_p = torch.sum(rel * gate_R[:, 2], dim=-1)
+
+        # Opening and frame geometry
+        opening_half = self.gate_opening / 2.0  # 0.15 m
+        frame_t = self.gate_frame_thickness      # 0.045 m
+        edge_offset = opening_half + frame_t * 0.5
+        safety_r = 0.05  # keep ~5cm away from frames
+
+        # Attraction: encourage being inside opening box in gate plane
+        # Hinge loss if outside opening in y or z
+        y_excess = torch.clamp(torch.abs(y_p) - opening_half, min=0.0)
+        z_excess = torch.clamp(torch.abs(z_p) - opening_half, min=0.0)
+        w_open = 12.0
+        c_open_hinge = w_open * (y_excess ** 2 + z_excess ** 2)
+
+        # Soft attraction toward the 2D opening center (y=0, z=0) when near the gate plane
+        near_plane = torch.abs(x_n) < 0.6
+        w_center = 4.5
+        c_center = torch.where(near_plane, w_center * (y_p ** 2 + z_p ** 2), torch.zeros_like(x_n))
+
+        # Obstacle avoidance: vertical frames modeled as infinite poles at y=±edge_offset
+        # Penalize inverse-square proximity inside safety radius
+        dy_left = torch.abs(y_p + edge_offset)
+        dy_right = torch.abs(y_p - edge_offset)
+        w_vert = 120.0
+        c_vert = w_vert * (torch.clamp(safety_r - dy_left, min=0.0) ** 2 + torch.clamp(safety_r - dy_right, min=0.0) ** 2)
+
+        # Obstacle avoidance: horizontal frames modeled as capsules along y at z=±edge_offset
+        dz_top = torch.abs(z_p - edge_offset)
+        dz_bottom = torch.abs(z_p + edge_offset)
+        # Active only when within lateral span around the gate opening (|y| <= opening_half + frame_t)
+        within_span = torch.abs(y_p) <= (opening_half + frame_t)
+        w_horiz = 100.0
+        c_horiz = torch.where(within_span, w_horiz * (torch.clamp(safety_r - dz_top, min=0.0) ** 2 + torch.clamp(safety_r - dz_bottom, min=0.0) ** 2), torch.zeros_like(dz_top))
+
+        c_gate_struct = c_open_hinge + c_center + c_vert + c_horiz
 
         # 2. Velocity penalty - light damping
         c_vel = torch.sum(self.cost_weights["velocity"] * vel ** 2, dim=-1)
+
+        # 2a. Risk-aware slowdown: if too close to any frame, add speed penalty
+        min_frame_dist = torch.minimum(
+            torch.minimum(dy_left, dy_right),
+            torch.minimum(dz_top, dz_bottom)
+        )
+        high_risk = min_frame_dist < (safety_r + 0.01)
+        w_slow = 0.4
+        c_slow = torch.where(high_risk, w_slow * torch.sum(vel ** 2, dim=-1), torch.zeros_like(min_frame_dist))
 
         # 3. Attitude - prefer level flight
         c_att = torch.sum(self.cost_weights["attitude"] * rpy ** 2, dim=-1)
@@ -210,10 +265,8 @@ class AttitudeMPPIController(Controller):
         z_violation = torch.clamp(0.03 - pos[..., 2], min=0.0)
         c_z_floor = self.cost_weights["z_floor"] * z_violation ** 2
 
-        # Total cost (simplified - no redundancies like progress==position or broken control_rate)
-        total_cost = c_pos + c_vel + c_att + c_z_floor
-
-        return total_cost
+        # Total cost (simplified) + gate structure shaping and risk-aware slowdown
+        total_cost = c_pos + c_vel + c_att + c_z_floor + c_gate_struct + c_slow
 
         return total_cost
 
