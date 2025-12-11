@@ -47,15 +47,11 @@ class AttitudeMPPIController(Controller):
         self._dt = 1 / config.env.freq
         self._config = config
 
-        # MPPI hyperparameters - optimized for robust trajectory optimization
-        self.mppi_horizon = 25  # Planning horizon steps (increased for multi-gate foresight)
-        self.mppi_dt = self._dt * 2  # 0.04s time discretization
-        self.num_samples = 6000  # Increased for better optimization quality
-        self.lambda_weight = 10.0  # Temperature parameter
-        
-        # Gate geometry constants
-        self.gate_opening = 0.30  # 30cm square opening
-        self.gate_frame_thickness = 0.045  # 4.5cm frame
+        # MPPI parameters - tuned for stability
+        self.mppi_horizon = 20  # Longer horizon for smoother planning
+        self.mppi_dt = self._dt * 2  # Coarser time discretization (0.04s instead of 0.02s)
+        self.num_samples = 2000  # Reduced for faster computation
+        self.lambda_weight = 10.0  # Higher temperature = smoother controls
 
         # Device selection
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -103,12 +99,15 @@ class AttitudeMPPIController(Controller):
         self.thrust_max = self.drone_params["thrust_max"] * 4
         self.hover_thrust = self.drone_params["mass"] * abs(self.drone_params["gravity_vec"][-1])
 
-        # Simplified cost weights - balanced aggressive for 4-gate success
+        # Tuned cost weights for smoother behavior
         self.cost_weights = {
-              "position": torch.tensor([20.0, 20.0, 16.0], device=self.device, dtype=self.dtype),  # Breakthrough config
-              "velocity": torch.tensor([0.05, 0.05, 0.15], device=self.device, dtype=self.dtype),  # Breakthrough config
-            "attitude": torch.tensor([1.5, 1.5, 0.2], device=self.device, dtype=self.dtype),  # Lower for agility
-            "z_floor": 2000.0,  # Strong penalty for ground collision (Z < 0.03m)
+            "position": torch.tensor([10.0, 10.0, 20.0], device=self.device, dtype=self.dtype),
+            "velocity": torch.tensor([0.5, 0.5, 0.5], device=self.device, dtype=self.dtype),
+            "attitude": torch.tensor([5.0, 5.0, 1.0], device=self.device, dtype=self.dtype),
+            "att_rate": torch.tensor([2.0, 2.0, 1.0], device=self.device, dtype=self.dtype),
+            "control_effort": torch.tensor([1.0, 1.0, 0.5, 2.0], device=self.device, dtype=self.dtype),
+            "control_rate": 5.0,  # Penalize control changes
+            "gate_progress": 15.0,
         }
 
         # Store previous control for rate penalty
@@ -169,18 +168,17 @@ class AttitudeMPPIController(Controller):
         print(f"  - Samples: {self.num_samples}")
         print(f"  - Lambda: {self.lambda_weight}")
         print(f"  - RPY limits: ±{np.rad2deg(self.rpy_max):.1f}°")
-        print(f"  - Gate opening: {self.gate_opening*100:.0f}cm square (frame: {self.gate_frame_thickness*100:.1f}cm)")
 
     def compute_running_cost(
         self,
         state: torch.Tensor,
         control: torch.Tensor
     ) -> torch.Tensor:
-        """Simplified MPPI running cost - removed redundant terms.
+        """Compute running cost for MPPI optimization. 
 
         Args:
-            state: State tensor (..., 12): [pos(3), rpy(3), vel(3), drpy(3)]
-            control: Control tensor (..., 4): [roll_cmd, pitch_cmd, yaw_cmd, thrust_cmd]
+            state:  State tensor (... , 12): [pos(3), rpy(3), vel(3), drpy(3)]
+            control: Control tensor (... , 4): [roll_cmd, pitch_cmd, yaw_cmd, thrust_cmd]
 
         Returns:
             Cost tensor of shape (...)
@@ -189,31 +187,65 @@ class AttitudeMPPIController(Controller):
         pos = state[..., 0:3]
         rpy = state[..., 3:6]
         vel = state[..., 6:9]
+        drpy = state[..., 9:12]
 
-        # Target position (gate center)
+        # Current goal
         goal_pos = torch.tensor(self.goal, dtype=self.dtype, device=self.device)
 
-        # 1. Position tracking - MAIN OBJECTIVE with distance-adaptive scaling
+        # 1. Position error cost (quadratic)
         pos_error = pos - goal_pos
-        dist_to_goal = torch.norm(pos_error, dim=-1)
-        # 2x position cost when within 0.5m (breakthrough config)
-        proximity_scale = torch.where(dist_to_goal < 0.5, 2.0, 1.0)
-        c_pos = proximity_scale * torch.sum(self.cost_weights["position"] * pos_error ** 2, dim=-1)
+        dist_sq = torch.sum(self.cost_weights["position"] * pos_error ** 2, dim=-1)
+        c_pos = dist_sq
 
-        # 2. Velocity penalty - light damping
-        c_vel = torch.sum(self.cost_weights["velocity"] * vel ** 2, dim=-1)
+        # 2. Velocity cost - penalize excessive speed
+        speed_sq = torch.sum(self.cost_weights["velocity"] * vel ** 2, dim=-1)
+        c_vel = speed_sq
 
-        # 3. Attitude - prefer level flight
-        c_att = torch.sum(self.cost_weights["attitude"] * rpy ** 2, dim=-1)
+        # 3. Attitude cost - prefer level flight
+        att_error_sq = torch.sum(self.cost_weights["attitude"] * rpy ** 2, dim=-1)
+        c_att = att_error_sq
 
-        # 4. Ground collision penalty (critical safety constraint)
-        z_violation = torch.clamp(0.03 - pos[..., 2], min=0.0)
-        c_z_floor = self.cost_weights["z_floor"] * z_violation ** 2
+        # 4. Attitude rate cost - penalize fast rotations
+        att_rate_sq = torch.sum(self.cost_weights["att_rate"] * drpy ** 2, dim=-1)
+        c_att_rate = att_rate_sq
 
-        # Total cost (simplified - no redundancies like progress==position or broken control_rate)
-        total_cost = c_pos + c_vel + c_att + c_z_floor
+        # 5. Control effort - penalize deviation from hover
+        control_ref = torch.tensor(
+            [0.0, 0.0, 0.0, self.hover_thrust],
+            dtype=self.dtype,
+            device=self.device
+        )
+        control_error = control - control_ref
+        c_control_effort = torch.sum(
+            self.cost_weights["control_effort"] * control_error ** 2, 
+            dim=-1
+        )
 
-        return total_cost
+        # 6. Control rate penalty - encourage smooth control changes
+        c_control_rate = 0.0
+        if self.prev_control is not None:
+            prev_ctrl = self.prev_control.to(self.device)
+            # Only penalize the first control in the sequence
+            if control.dim() == 2:  # Batch of controls
+                control_change = control[0] - prev_ctrl
+            else:  # Single control
+                control_change = control - prev_ctrl
+            c_control_rate = self.cost_weights["control_rate"] * torch.sum(control_change ** 2)
+
+        # 7. Progress-based cost (reward moving closer to gate)
+        dist = torch.sqrt(dist_sq + 1e-6)
+        c_progress = self.cost_weights["gate_progress"] * dist
+
+        # Total cost
+        total_cost = (
+            c_pos +
+            c_vel +
+            c_att +
+            c_att_rate +
+            c_control_effort +
+            c_control_rate +
+            c_progress
+        )
 
         return total_cost
 
@@ -263,21 +295,18 @@ class AttitudeMPPIController(Controller):
         control_np[0: 3] = np.clip(control_np[0:3], -self.rpy_max, self.rpy_max)
         control_np[3] = np.clip(control_np[3], self.thrust_min, self.thrust_max)
 
-        # Enhanced debug output
+        # Debug output (reduced frequency)
         if self.step_count % 10 == 0:
             pos = obs["pos"]
             vel = obs["vel"]
-            gate_pos = self.gates_pos[self.target_gate_idx]
-            dist_to_gate = np.linalg.norm(pos - gate_pos)
-            z_offset = pos[2] - gate_pos[2]
-            xy_dist = np.linalg.norm(pos[:2] - gate_pos[:2])
+            dist_to_gate = np.linalg.norm(pos - self.goal)
             speed = np.linalg.norm(vel)
-            print(f"[AttitudeMPPI] Step {self.step_count:4d} | "
-                  f"G{self.target_gate_idx} | "
-                  f"Pos:[{pos[0]:5.2f},{pos[1]:5.2f},{pos[2]:5.2f}] | "
-                  f"3D:{dist_to_gate:4.2f}m XY:{xy_dist:4.2f}m ΔZ:{z_offset:+.2f}m | "
-                  f"V:{speed:.1f}m/s | "
-                  f"T:{control_np[3]:.2f}N")
+            print(f"[AttitudeMPPI] Step {self.step_count: 4d} | "
+                  f"Gate {self.target_gate_idx} | "
+                  f"Dist:  {dist_to_gate: 5.2f}m | "
+                  f"Speed: {speed:4.2f}m/s | "
+                  f"RPY: [{np.rad2deg(control_np[0]):5.1f}, {np.rad2deg(control_np[1]):5.1f}, {np.rad2deg(control_np[2]):5.1f}]° | "
+                  f"T: {control_np[3]:.2f}N")
 
         return control_np
 
