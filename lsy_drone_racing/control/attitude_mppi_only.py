@@ -101,7 +101,7 @@ class AttitudeMPPIController(Controller):
         self.old_gate_pos = self.goal.copy()
 
         # More conservative control limits
-        self.rpy_max = 0.3  # ±17 degrees (more conservative)
+        self.rpy_max = 0.5 #0.3  # ±17 degrees (more conservative)
         self.thrust_min = self.drone_params["thrust_min"] * 4
         self.thrust_max = self.drone_params["thrust_max"] * 4
         self.hover_thrust = self.drone_params["mass"] * abs(self.drone_params["gravity_vec"][-1])
@@ -298,7 +298,11 @@ class AttitudeMPPIController(Controller):
             self.target_gate_idx = new_target_idx
             self.prev_goal = self.goal.copy()
             self.goal = self.gates_pos[self.target_gate_idx]
-   
+            # small forward offset through the gate
+            gate_quat = obs["gates_quat"][self.target_gate_idx]
+            rot = R.from_quat(gate_quat)
+            forward = rot.as_matrix()[:, 0]
+            self.goal = self.goal + 0.0 * forward
             print(f"\n[AttitudeMPPI] Updated target to gate {self.target_gate_idx}")
             
             # Reset control sequence on gate change
@@ -316,7 +320,7 @@ class AttitudeMPPIController(Controller):
                 gate_quat = obs["gates_quat"][self.target_gate_idx]
                 rot = R.from_quat(gate_quat)
                 forward = rot.as_matrix()[:, 0]
-                self.goal = self.goal + 0 * forward
+                self.goal = self.goal + 0.0 * forward
                 print(f"\n[AttitudeMPPI] Goal position updated (same gate {self.target_gate_idx}): {self.goal}")
                 
                 # Reset control sequence on goal position change
