@@ -99,6 +99,14 @@ class AttitudeMPPIController(Controller):
         self.goal = self.gates_pos[self.target_gate_idx]
         self.prev_goal = self.goal.copy()
         self.old_gate_pos = self.goal.copy()
+        # Three-stage goal tracking: 1→center, 2→beyond plane, 3→switch
+        self.gate_stage = 1
+        self.stage_offset_normal = 0.12  # 12 cm beyond the gate plane (more decisive)
+        self.stage_eps = 0.01            # small epsilon for pass detection
+        # Anti-stall shaping during Stage 2
+        self.stage_min_speed = 0.4       # m/s minimum desired speed near plane
+        self.w_plane_commit = 6.0        # weight to penalize being behind plane
+        self.w_speed_floor = 2.5         # weight to penalize low speed near plane
 
         # More conservative control limits
         self.rpy_max = 0.5 #0.3  # ±17 degrees (more conservative)
@@ -272,6 +280,19 @@ class AttitudeMPPIController(Controller):
         # Total cost (simplified) + gate structure shaping and risk-aware slowdown
         total_cost = c_pos + c_vel + c_att + c_z_floor + c_gate_struct + c_slow
 
+        # 5. Stage-2 anti-stall shaping: encourage crossing plane and avoid stopping
+        # x_n is signed normal distance (positive after plane). During stage 2,
+        # penalize being behind the plane and very low speed near the plane.
+        stage2_active = torch.tensor(1.0 if self.gate_stage == 2 else 0.0,
+                                     dtype=self.dtype, device=self.device)
+        if stage2_active.item() > 0.0:
+            # Encourage positive x_n (cross the plane)
+            c_plane_commit = self.w_plane_commit * torch.clamp(-x_n, min=0.0)
+            # Encourage not stalling near the plane
+            v_norm = torch.norm(vel, dim=-1)
+            c_speed_floor = self.w_speed_floor * torch.clamp(self.stage_min_speed - v_norm, min=0.0)
+            total_cost = total_cost + stage2_active * (c_plane_commit + c_speed_floor)
+
         return total_cost
 
     def compute_control(
@@ -291,9 +312,9 @@ class AttitudeMPPIController(Controller):
         # curr_time = time()
         self.step_count += 1
 
-        # Update target gate if necessary
+        # Update target gate from env if it moves forward; ignore regressions to avoid flip-flop
         new_target_idx = int(obs["target_gate"])
-        if new_target_idx != self.target_gate_idx:
+        if new_target_idx > self.target_gate_idx:
             self.old_gate_pos = self.gates_pos[self.target_gate_idx]
             self.target_gate_idx = new_target_idx
             self.prev_goal = self.goal.copy()
@@ -303,6 +324,8 @@ class AttitudeMPPIController(Controller):
             rot = R.from_quat(gate_quat)
             forward = rot.as_matrix()[:, 0]
             self.goal = self.goal + 0.0 * forward
+            # Reset stage when switching gates
+            self.gate_stage = 1
             print(f"\n[AttitudeMPPI] Updated target to gate {self.target_gate_idx}")
             
             # Reset control sequence on gate change
@@ -310,7 +333,7 @@ class AttitudeMPPIController(Controller):
             initial_control[:, 3] = self.hover_thrust
             self.mppi.U = initial_control
         else:
-            # Check if goal position has changed even if index stays the same
+            # Same gate or env behind our internal index → keep current index, but update dynamic goal position
             new_goal = obs["gates_pos"][self.target_gate_idx]
             if np.any(new_goal != self.old_gate_pos):
                 self.old_gate_pos = new_goal.copy()
@@ -327,6 +350,44 @@ class AttitudeMPPIController(Controller):
                 initial_control = torch.zeros((self.mppi_horizon, 4), dtype=self.dtype, device=self.device)
                 initial_control[:, 3] = self.hover_thrust
                 self.mppi.U = initial_control
+
+        # Stage-based goal tracking around gate plane
+        gate_center = obs["gates_pos"][self.target_gate_idx]
+        gate_quat = obs["gates_quat"][self.target_gate_idx]
+        rot = R.from_quat(gate_quat)
+        normal = rot.as_matrix()[:, 0]
+        rel = obs["pos"] - gate_center
+        x_n = float(np.dot(rel, normal))  # signed distance along gate normal
+
+        if self.gate_stage == 1:
+            # Approach gate center
+            self.goal = gate_center
+            if abs(x_n) <= self.stage_offset_normal:
+                # Switch to aiming 8 cm beyond the gate plane
+                self.gate_stage = 2
+                self.goal = gate_center + self.stage_offset_normal * normal
+                initial_control = torch.zeros((self.mppi_horizon, 4), dtype=self.dtype, device=self.device)
+                initial_control[:, 3] = self.hover_thrust
+                self.mppi.U = initial_control
+                print(f"[AttitudeMPPI] Stage 2: aim {self.stage_offset_normal*100:.0f}cm beyond plane")
+        elif self.gate_stage == 2:
+            # Aim beyond plane
+            self.goal = gate_center + self.stage_offset_normal * normal
+            # Detect passing the plane (x_n >= 0 with small epsilon)
+            if x_n >= 0.0 + self.stage_eps:
+                # Immediately switch to next gate target
+                next_idx = int(obs.get("target_gate", self.target_gate_idx))
+                if next_idx == self.target_gate_idx:
+                    next_idx = min(self.target_gate_idx + 1, len(self.gates_pos) - 1)
+                self.target_gate_idx = next_idx
+                self.prev_goal = self.goal.copy()
+                self.goal = self.gates_pos[self.target_gate_idx]
+                self.old_gate_pos = self.goal.copy()
+                self.gate_stage = 1
+                initial_control = torch.zeros((self.mppi_horizon, 4), dtype=self.dtype, device=self.device)
+                initial_control[:, 3] = self.hover_thrust
+                self.mppi.U = initial_control
+                print(f"\n[AttitudeMPPI] Passed gate; switching to gate {self.target_gate_idx}")
 
         # Convert observation to state tensor
         state = self.drone_model.obs_to_state(obs)
@@ -385,5 +446,6 @@ class AttitudeMPPIController(Controller):
         # Reset step counter and previous control
         self.step_count = 0
         self.prev_control = None
+        self.gate_stage = 1
         
         print("[AttitudeMPPI] Episode reset")
