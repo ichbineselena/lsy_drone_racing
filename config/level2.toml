@@ -10,14 +10,14 @@ trajectory_builder = "mppi"
 [deploy]
 ### Settings only relevant for deployment
 # Whether to check if gate and obstacle positions observed by vicon are within the limits defined down below.
-check_race_track = true
+check_race_track = false
 # Whether to check if the drone start position is within the limits specified down below.
 check_drone_start_pos = true
 # Lets you practice your controller without putting up gates & obstacles, assumes nominal positions given below.
-real_track_objects = false
+real_track_objects = true
 
 [[deploy.drones]]
-id = 11
+id = 20
 channel = 100
 drone_model = "cf21B_500"                        # Model of the drone, i.e., cf2x_L250, cf2x_P250, cf2x_T500, cf21B_500. For this course, we use cf21B_500
 
@@ -65,13 +65,13 @@ rpy = [0.0, 0.0, 0.0]
 
 # Obstacle height: 1.52m + reflective marker on top. Height is measured from the ground to the top of the obstacle.
 [[env.track.obstacles]]
-pos = [0.0, 0.75, 1.55]
+pos = [0.0, 1.75, 1.55]
 [[env.track.obstacles]]
-pos = [1.0, 0.25, 1.55]
+pos = [1.0, 1.25, 1.55]
 [[env.track.obstacles]]
-pos = [-1.5, -0.25, 1.55]
+pos = [-1.5, -1.25, 1.55]
 [[env.track.obstacles]]
-pos = [-0.5, -0.75, 1.55]
+pos = [-0.5, -1.75, 1.55]
 
 [[env.track.drones]]
 pos = [-1.5, 0.75, 0.01]

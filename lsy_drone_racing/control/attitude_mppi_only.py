@@ -21,6 +21,8 @@ from lsy_drone_racing.utils.model_torch import DroneModelTorch
 
 from lsy_drone_racing.control import Controller
 
+#from time import time
+
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
@@ -50,7 +52,7 @@ class AttitudeMPPIController(Controller):
         # MPPI hyperparameters - optimized for robust trajectory optimization
         self.mppi_horizon = 25  # Planning horizon steps (proven stable for 4-gate success)
         self.mppi_dt = self._dt * 2  # 0.04s time discretization
-        self.num_samples = 6000  # Stable optimization quality
+        self.num_samples = 3000  # Stable optimization quality
         self.lambda_weight = 9.5  # Temperature parameter tuned for improved transitions
         
         # Gate geometry constants
@@ -96,6 +98,7 @@ class AttitudeMPPIController(Controller):
         self.target_gate_idx = int(obs["target_gate"])
         self.goal = self.gates_pos[self.target_gate_idx]
         self.prev_goal = self.goal.copy()
+        self.old_gate_pos = self.goal.copy()
 
         # More conservative control limits
         self.rpy_max = 0.3  # ±17 degrees (more conservative)
@@ -117,6 +120,7 @@ class AttitudeMPPIController(Controller):
         # Define dynamics wrapper for MPPI
         def dynamics_fn(state, control):
             """Dynamics function for MPPI."""
+            #print("Position", state[..., 0:3].shape)
             return self.drone_model.dynamics(state, control, self.mppi_dt)
 
         # Define running cost for MPPI
@@ -284,20 +288,41 @@ class AttitudeMPPIController(Controller):
         Returns:
             Control command:  [roll_cmd, pitch_cmd, yaw_cmd, thrust_cmd]
         """
+        # curr_time = time()
         self.step_count += 1
 
         # Update target gate if necessary
         new_target_idx = int(obs["target_gate"])
         if new_target_idx != self.target_gate_idx:
+            self.old_gate_pos = self.gates_pos[self.target_gate_idx]
             self.target_gate_idx = new_target_idx
             self.prev_goal = self.goal.copy()
             self.goal = self.gates_pos[self.target_gate_idx]
+   
             print(f"\n[AttitudeMPPI] Updated target to gate {self.target_gate_idx}")
             
-            # Optionally reset control sequence on gate change
+            # Reset control sequence on gate change
             initial_control = torch.zeros((self.mppi_horizon, 4), dtype=self.dtype, device=self.device)
             initial_control[:, 3] = self.hover_thrust
             self.mppi.U = initial_control
+        else:
+            # Check if goal position has changed even if index stays the same
+            new_goal = obs["gates_pos"][self.target_gate_idx]
+            if np.any(new_goal != self.old_gate_pos):
+                self.old_gate_pos = new_goal.copy()
+                self.prev_goal = self.goal.copy()
+                self.goal = new_goal.copy()
+                # small forward offset through the gate
+                gate_quat = obs["gates_quat"][self.target_gate_idx]
+                rot = R.from_quat(gate_quat)
+                forward = rot.as_matrix()[:, 0]
+                self.goal = self.goal + 0 * forward
+                print(f"\n[AttitudeMPPI] Goal position updated (same gate {self.target_gate_idx}): {self.goal}")
+                
+                # Reset control sequence on goal position change
+                initial_control = torch.zeros((self.mppi_horizon, 4), dtype=self.dtype, device=self.device)
+                initial_control[:, 3] = self.hover_thrust
+                self.mppi.U = initial_control
 
         # Convert observation to state tensor
         state = self.drone_model.obs_to_state(obs)
@@ -331,7 +356,7 @@ class AttitudeMPPIController(Controller):
                   f"3D:{dist_to_gate:4.2f}m XY:{xy_dist:4.2f}m ΔZ:{z_offset:+.2f}m | "
                   f"V:{speed:.1f}m/s | "
                   f"T:{control_np[3]:.2f}N")
-
+        # print(f"[AttitudeMPPI] Computation time: {time() - curr_time:.4f}s")
         return control_np
 
     def step_callback(
