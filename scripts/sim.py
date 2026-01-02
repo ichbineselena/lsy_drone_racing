@@ -19,7 +19,7 @@ import jax.numpy as jp
 import numpy as np
 from gymnasium.wrappers.jax_to_numpy import JaxToNumpy
 
-from lsy_drone_racing.utils import load_config, load_controller, draw_line
+from lsy_drone_racing.utils import load_config, load_controller, draw_line, draw_point, draw_capsule, draw_box
 
 if TYPE_CHECKING:
     from ml_collections import ConfigDict
@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 def simulate(
-    config: str = "level2.toml",
+    config: str = "level3.toml",
     controller: str | None = None,
     n_runs: int = 1,
     render: bool | None = None,
@@ -87,81 +87,240 @@ def simulate(
             curr_time = i / config.env.freq
 
             action = controller.compute_control(obs, info)
-            # Draw planned trajectory from controller (if provided).
-            # Controllers may expose a `get_planned_trajectory()` method returning an (N,3) array
-            # or a `_last_planned_pos` attribute.
-            try:
-                traj_points = None
-                if hasattr(controller, "get_planned_trajectory"):
-                    traj_points = controller.get_planned_trajectory()
-                elif hasattr(controller, "_last_planned_pos"):
-                    traj_points = getattr(controller, "_last_planned_pos")
-                if traj_points is not None:
-                    # ensure an ndarray and correct shape
-                    import numpy as _np
+            
+            # --- Draw visualizations ---
+            if config.sim.render and config.sim.visualize:
+                try:
+                    # 1. Draw current goal point
+                    if hasattr(controller, 'goal'):
+                        goal_pos = controller.goal
+                        draw_point(env, goal_pos, color=(1.0, 0.0, 0.0, 1.0), size=0.03)
+                    
+                    # 2. Draw obstacle modeling
+                    if hasattr(controller, 'obstacles_pos') and len(controller.obstacles_pos) > 0:
+                        if hasattr(controller, 'obstacle_radius') and hasattr(controller, 'obstacle_half_length'):
+                            for obs_pos in controller.obstacles_pos:
+                                # Draw capsule with safety margin (cyan)
+                                bottom = obs_pos.copy()
+                                bottom[2] -= controller.obstacle_half_length
+                                top = obs_pos.copy()
+                                top[2] += controller.obstacle_half_length
+                                
+                                draw_capsule(
+                                    env,
+                                    start=bottom,
+                                    end=top,
+                                    radius=controller.obstacle_radius + controller.obstacle_safety_margin,
+                                    color=(0.0, 1.0, 1.0, 0.4),  # Cyan with transparency
+                                    segments=12
+                                )
+                                
+                                # Draw actual obstacle size (gray)
+                                draw_capsule(
+                                    env,
+                                    start=bottom,
+                                    end=top,
+                                    radius=controller.obstacle_radius,
+                                    color=(0.5, 0.5, 0.5, 0.7),  # Gray for actual size
+                                    segments=12
+                                )
+                    
+                    # 3. Draw current gate frame modeling
+                    if hasattr(controller, 'current_gate_center') and hasattr(controller, 'current_gate_quat'):
+                        if hasattr(controller, 'gate_opening') and hasattr(controller, 'gate_frame_thickness'):
+                            # Draw gate opening box
+                            half_opening = controller.gate_opening / 2.0
+                            half_sizes = np.array([0.01, half_opening, half_opening])  # Thin in x direction
+                            draw_box(
+                                env,
+                                center=controller.current_gate_center,
+                                quat=controller.current_gate_quat,
+                                half_sizes=half_sizes,
+                                color=(0.0, 1.0, 0.0, 0.3)  # Green for opening
+                            )
+                            
+                            # Draw gate frames
+                            rot = R.from_quat(controller.current_gate_quat)
+                            R_matrix = rot.as_matrix()
+                            total_half = half_opening + controller.gate_frame_thickness / 2.0
+                            
+                            # Define frame positions
+                            # Left vertical frame
+                            left_center_local = np.array([0, -total_half, 0])
+                            left_center_world = controller.current_gate_center + R_matrix @ left_center_local
+                            left_top = left_center_world + R_matrix @ np.array([0, 0, half_opening])
+                            left_bottom = left_center_world - R_matrix @ np.array([0, 0, half_opening])
+                            
+                            draw_capsule(
+                                env,
+                                start=left_top,
+                                end=left_bottom,
+                                radius=controller.gate_frame_thickness / 2.0,
+                                color=(1.0, 1.0, 0.0, 0.6),  # Yellow for frame
+                                segments=8
+                            )
+                            
+                            # Right vertical frame
+                            right_center_local = np.array([0, total_half, 0])
+                            right_center_world = controller.current_gate_center + R_matrix @ right_center_local
+                            right_top = right_center_world + R_matrix @ np.array([0, 0, half_opening])
+                            right_bottom = right_center_world - R_matrix @ np.array([0, 0, half_opening])
+                            
+                            draw_capsule(
+                                env,
+                                start=right_top,
+                                end=right_bottom,
+                                radius=controller.gate_frame_thickness / 2.0,
+                                color=(1.0, 1.0, 0.0, 0.6),
+                                segments=8
+                            )
+                            
+                            # Top horizontal frame
+                            top_center_local = np.array([0, 0, total_half])
+                            top_center_world = controller.current_gate_center + R_matrix @ top_center_local
+                            top_left = top_center_world - R_matrix @ np.array([0, half_opening, 0])
+                            top_right = top_center_world + R_matrix @ np.array([0, half_opening, 0])
+                            
+                            draw_capsule(
+                                env,
+                                start=top_left,
+                                end=top_right,
+                                radius=controller.gate_frame_thickness / 2.0,
+                                color=(1.0, 1.0, 0.0, 0.6),
+                                segments=8
+                            )
+                            
+                            # Bottom horizontal frame
+                            bottom_center_local = np.array([0, 0, -total_half])
+                            bottom_center_world = controller.current_gate_center + R_matrix @ bottom_center_local
+                            bottom_left = bottom_center_world - R_matrix @ np.array([0, half_opening, 0])
+                            bottom_right = bottom_center_world + R_matrix @ np.array([0, half_opening, 0])
+                            
+                            draw_capsule(
+                                env,
+                                start=bottom_left,
+                                end=bottom_right,
+                                radius=controller.gate_frame_thickness / 2.0,
+                                color=(1.0, 1.0, 0.0, 0.6),
+                                segments=8
+                            )
+                            
+                            # Draw gate normal vector
+                            normal_end = controller.current_gate_center + R_matrix[:, 0] * 0.3
+                            draw_line(
+                                env,
+                                np.array([controller.current_gate_center, normal_end]),
+                                rgba=np.array([0.0, 0.0, 1.0, 1.0]),
+                                min_size=1.0,
+                                max_size=1.0
+                            )
+                    
+                except Exception as e:
+                    # Silently fail - visualization shouldn't break the simulation
+                    pass
+            
+            # --- Draw optimal MPPI trajectory ---
+            if config.sim.visualize:
+                try:
+                    if hasattr(controller, 'mppi'):
+                        # Get the optimal control sequence and simulate forward
+                        mppi = controller.mppi
+                        
+                        # The optimal trajectory is stored in mppi.U (control sequence)
+                        # We need to simulate the dynamics forward to get the state trajectory
+                        if hasattr(mppi, 'states') and mppi.states is not None:
+                            # Get the optimal trajectory from the last MPPI iteration
+                            # states shape: [1, K, T, nx] where nx=12
+                            states = mppi.states
+                            if states is not None:
+                                # Get the optimal trajectory (first sample is the nominal)
+                                states_np = states[0, 0].cpu().numpy()  # Shape: [T, nx]
+                                
+                                # Extract position coordinates (first 3 columns)
+                                pos_traj = states_np[:, 0:3]
+                                
+                                # Draw the optimal trajectory as a cyan line
+                                if len(pos_traj) > 1:
+                                    draw_line(
+                                        env,
+                                        pos_traj,
+                                        rgba=np.array([0.0, 1.0, 1.0, 1.0]),  # Cyan color
+                                        min_size=2.0,
+                                        max_size=4.0,
+                                    )
+                        else:
+                            # Fallback: Simulate forward using current state and optimal controls
+                            import torch
+                            current_state = controller.drone_model.obs_to_state(obs)
+                            
+                            # Get optimal control sequence
+                            optimal_controls = mppi.U  # Shape: [T, 4]
+                            
+                            # Simulate trajectory forward
+                            state_tensor = current_state.clone()
+                            trajectory = [state_tensor.clone()]
+                            
+                            for t in range(min(controller.mppi_horizon, 25)):  # Limit to 25 steps for visibility
+                                control_t = optimal_controls[t].unsqueeze(0)
+                                state_tensor = controller.drone_model.dynamics(
+                                    state_tensor, 
+                                    control_t, 
+                                    controller.mppi_dt
+                                )
+                                trajectory.append(state_tensor.clone())
+                            
+                            # Convert to numpy array
+                            trajectory_np = torch.cat(trajectory, dim=0).cpu().numpy()
+                            pos_traj = trajectory_np[:, 0:3]
+                            
+                            # Draw the simulated optimal trajectory
+                            if len(pos_traj) > 1:
+                                draw_line(
+                                    env,
+                                    pos_traj,
+                                    rgba=np.array([0.0, 1.0, 1.0, 0.8]),  # Semi-transparent cyan
+                                    min_size=2.0,
+                                    max_size=4.0,
+                                )
+                except Exception as e:
+                    # Silently fail - visualization shouldn't break the simulation
+                    pass
 
-                    traj_points = _np.asarray(traj_points)
-                    if traj_points.ndim == 2 and traj_points.shape[1] == 3:
-                        draw_line(env, traj_points)
-            except Exception:
-                # drawing must never break the sim loop
-                pass
-                        # --- Draw warm-start spline if available ---
-            try:
-                warm = getattr(controller, "_last_warmstart_pos", None)
-                if warm is not None:
-                    warm = np.asarray(warm)
-                    if warm.ndim == 2 and warm.shape[1] == 3:
-                        draw_line(
-                            env,
-                            warm,
-                            rgba=np.array([0.0, 1.0, 0.0, 1.0]),  # green
-                            min_size=2.0,
-                            max_size=4.0,
-                        )
-            except Exception:
-                print("Could not draw warm-start trajectory.")
-                pass
+                # Draw planned trajectory from controller (if provided).
+                # Controllers may expose a `get_planned_trajectory()` method returning an (N,3) array
+                # or a `_last_planned_pos` attribute.
+                try:
+                    traj_points = None
+                    if hasattr(controller, "get_planned_trajectory"):
+                        traj_points = controller.get_planned_trajectory()
+                    elif hasattr(controller, "_last_planned_pos"):
+                        traj_points = getattr(controller, "_last_planned_pos")
+                    if traj_points is not None:
+                        # ensure an ndarray and correct shape
+                        import numpy as _np
 
-
-            # # --- Draw 20 lowest-cost MPPI trajectories as white lines ---
-            # try:
-            #     if hasattr(controller, "mppi"):
-            #         mppi = controller.mppi
-            #         states = getattr(mppi, "states", None)
-            #         costs  = getattr(mppi, "cost_total", None)
-
-            #         if states is not None and costs is not None:
-            #             import numpy as _np
-            #             costs = _np.asarray(costs)
-
-            #             # states shape: [1, K, T, nx]
-            #             rollouts = states[0].cpu().numpy()   # shape [K, T, nx]
-
-            #             K, T, nx = rollouts.shape
-            #             T_display = T  # number of steps to draw
-
-            #             # select best 20 trajectories
-            #             k = min(20, K)
-            #             best_idx = _np.argsort(costs)[:k]
-
-            #             for idx in best_idx:
-            #                 traj = rollouts[idx, :, :3]  # xyz only
-
-            #                 # draw each segment of this sampled trajectory
-            #                 for a, b in zip(traj[:-1], traj[1:]):
-            #                     env._env.draw_line(
-            #                         start=a,
-            #                         end=b,
-            #                         color=(1.0, 1.0, 1.0, 0.15),  # slightly transparent white
-            #                         width=1.0
-            #                     )
-
-            # except Exception as e:
-            #     print("Could not draw MPPI sample trajectories:", e)
-
-
-
+                        traj_points = _np.asarray(traj_points)
+                        if traj_points.ndim == 2 and traj_points.shape[1] == 3:
+                            draw_line(env, traj_points)
+                except Exception:
+                    # drawing must never break the sim loop
+                    pass
+                
+                # --- Draw warm-start spline if available ---
+                try:
+                    warm = getattr(controller, "_last_warmstart_pos", None)
+                    if warm is not None:
+                        warm = np.asarray(warm)
+                        if warm.ndim == 2 and warm.shape[1] == 3:
+                            draw_line(
+                                env,
+                                warm,
+                                rgba=np.array([0.0, 1.0, 0.0, 1.0]),  # green
+                                min_size=2.0,
+                                max_size=4.0,
+                            )
+                except Exception:
+                    pass
 
             # Convert to a buffer that meets XLA's alginment restrictions to prevent warnings. See
             # https://github.com/jax-ml/jax/discussions/6055

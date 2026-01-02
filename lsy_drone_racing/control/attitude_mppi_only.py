@@ -58,6 +58,13 @@ class AttitudeMPPIController(Controller):
         # Gate geometry constants
         self.gate_opening = 0.30  # 30cm square opening
         self.gate_frame_thickness = 0.045  # 4.5cm frame
+        
+        # Obstacle geometry constants (from MuJoCo model)
+        self.obstacle_radius = 0.015  # 1.5cm radius
+        self.obstacle_half_length = 1.5  # half-length of capsule
+        self.obstacle_length = 1.5  # total length
+        self.obstacle_safety_margin = 0.05  # 5cm safety margin
+        self.obstacle_avoidance_weight = 50.0  # Weight for obstacle cost
 
         # Device selection
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -99,6 +106,12 @@ class AttitudeMPPIController(Controller):
         self.goal = self.gates_pos[self.target_gate_idx]
         self.prev_goal = self.goal.copy()
         self.old_gate_pos = self.goal.copy()
+        
+        self.current_gate_center = np.array(obs["gates_pos"][self.target_gate_idx], dtype=float)
+        self.current_gate_quat = np.array(obs["gates_quat"][self.target_gate_idx], dtype=float)
+        
+        # Store obstacles information
+        self.obstacles_pos = obs["obstacles_pos"].copy() if "obstacles_pos" in obs else np.array([])
 
         # More conservative control limits
         self.rpy_max = 0.5 #0.3  # ±17 degrees (more conservative)
@@ -112,6 +125,7 @@ class AttitudeMPPIController(Controller):
               "velocity": torch.tensor([0.040, 0.040, 0.125], device=self.device, dtype=self.dtype),  # Stabilized without losing too much speed
             "attitude": torch.tensor([1.5, 1.5, 0.2], device=self.device, dtype=self.dtype),  # Lower for agility
             "z_floor": 2000.0,  # Strong penalty for ground collision (Z < 0.03m)
+            "obstacle": self.obstacle_avoidance_weight,  # Obstacle avoidance weight
         }
 
         # Store previous control for rate penalty
@@ -120,7 +134,6 @@ class AttitudeMPPIController(Controller):
         # Define dynamics wrapper for MPPI
         def dynamics_fn(state, control):
             """Dynamics function for MPPI."""
-            #print("Position", state[..., 0:3].shape)
             return self.drone_model.dynamics(state, control, self.mppi_dt)
 
         # Define running cost for MPPI
@@ -174,6 +187,93 @@ class AttitudeMPPIController(Controller):
         print(f"  - Lambda: {self.lambda_weight}")
         print(f"  - RPY limits: ±{np.rad2deg(self.rpy_max):.1f}°")
         print(f"  - Gate opening: {self.gate_opening*100:.0f}cm square (frame: {self.gate_frame_thickness*100:.1f}cm)")
+        print(f"  - Obstacles: {len(self.obstacles_pos)} obstacles with {self.obstacle_safety_margin*100:.1f}cm safety margin")
+
+    def compute_obstacle_cost(
+        self,
+        pos: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute obstacle avoidance cost for given positions.
+        
+        Args:
+            pos: Position tensor of shape (..., 3)
+            
+        Returns:
+            Obstacle cost tensor of shape (...)
+        """
+        if len(self.obstacles_pos) == 0:
+            return torch.zeros(pos.shape[:-1], dtype=self.dtype, device=self.device)
+        
+        # Convert obstacles to tensor
+        obstacles_t = torch.tensor(self.obstacles_pos, dtype=self.dtype, device=self.device)
+        
+        # Initialize total cost
+        total_cost = torch.zeros(pos.shape[:-1], dtype=self.dtype, device=self.device)
+        
+        # For each obstacle (capsule oriented vertically)
+        for i in range(len(self.obstacles_pos)):
+            # Get obstacle center position
+            obstacle_center = obstacles_t[i]
+            
+            # Capsule parameters
+            radius = self.obstacle_radius
+            half_length = self.obstacle_half_length
+            safety_margin = self.obstacle_safety_margin
+            effective_radius = radius + safety_margin
+            
+            # Vector from obstacle center to drone position
+            rel_vec = pos - obstacle_center
+            
+            # For vertical capsule, we need to find closest point on the line segment
+            # from (obstacle_center - [0,0,half_length]) to (obstacle_center + [0,0,half_length])
+            
+            # Project onto vertical axis
+            z_proj = rel_vec[..., 2]  # Z component
+            
+            # Clamp projection to [-half_length, half_length]
+            z_clamped = torch.clamp(z_proj, -half_length, half_length)
+            
+            # Closest point on the capsule segment
+            closest_point_z = obstacle_center[2] + z_clamped
+            closest_point = torch.stack([
+                torch.full_like(z_clamped, obstacle_center[0]),
+                torch.full_like(z_clamped, obstacle_center[1]),
+                closest_point_z
+            ], dim=-1)
+            
+            # Distance vector from closest point on capsule to drone
+            dist_vec = pos - closest_point
+            dist = torch.norm(dist_vec, dim=-1)
+            
+            # Inverse barrier cost: penalize being too close
+            # Use a smooth penalty function that increases as distance decreases
+            # Cost = weight / (distance^2 + epsilon) when distance < threshold
+            
+            # Threshold for penalty activation (safety margin + radius)
+            penalty_threshold = effective_radius * 2.0  # Start penalty at 2x effective radius
+            
+            # Distance to capsule surface (subtract radius)
+            surface_dist = dist - effective_radius
+            
+            # Apply penalty only when inside penalty threshold
+            mask = surface_dist < penalty_threshold
+            
+            if torch.any(mask):
+                # Smooth penalty: higher cost as distance decreases
+                # Use exponential barrier for smoothness
+                penalty = torch.exp(-surface_dist[mask] / (effective_radius * 0.5))
+                
+                # Scale by inverse of distance squared (becomes very large near obstacle)
+                inv_dist_sq = 1.0 / (surface_dist[mask] ** 2 + 0.01)  # Add epsilon for numerical stability
+                
+                # Combine penalties
+                obstacle_cost = self.cost_weights["obstacle"] * penalty * inv_dist_sq
+                
+                # Add to total cost at masked positions
+                total_cost = total_cost.clone()
+                total_cost[mask] = total_cost[mask] + obstacle_cost
+        
+        return total_cost
 
     def compute_running_cost(
         self,
@@ -204,8 +304,8 @@ class AttitudeMPPIController(Controller):
 
         # 1a. Attraction to gate opening and obstacle avoidance for gate frames
         # Transform position into gate-local coordinates: [x_normal, y_plane, z_plane]
-        gate_center_np = self.gates_pos[self.target_gate_idx]
-        gate_quat_np = self.gates_quat[self.target_gate_idx]
+        gate_center_np = self.current_gate_center
+        gate_quat_np = self.current_gate_quat
         gate_R_np = R.from_quat(gate_quat_np).as_matrix()
         gate_R = torch.tensor(gate_R_np, dtype=self.dtype, device=self.device)
         gate_center = torch.tensor(gate_center_np, dtype=self.dtype, device=self.device)
@@ -268,9 +368,18 @@ class AttitudeMPPIController(Controller):
         # 4. Ground collision penalty (critical safety constraint)
         z_violation = torch.clamp(0.03 - pos[..., 2], min=0.0)
         c_z_floor = self.cost_weights["z_floor"] * z_violation ** 2
+        
+        # 5. Obstacle avoidance cost
+        c_obstacle = self.compute_obstacle_cost(pos)
 
         # Total cost (simplified) + gate structure shaping and risk-aware slowdown
-        total_cost = c_pos + c_vel + c_att + c_z_floor + c_gate_struct + c_slow
+        total_cost = c_pos + c_vel + c_att + c_z_floor + c_gate_struct + c_slow + c_obstacle
+        
+        # Debug: Print obstacle cost if significant
+        if torch.any(c_obstacle > 1.0):
+            max_obstacle_cost = torch.max(c_obstacle).item()
+            if self.step_count % 20 == 0:
+                print(f"[AttitudeMPPI] Max obstacle cost: {max_obstacle_cost:.2f}")
 
         return total_cost
 
@@ -290,6 +399,22 @@ class AttitudeMPPIController(Controller):
         """
         # curr_time = time()
         self.step_count += 1
+        
+        # Update obstacles information
+        if "obstacles_pos" in obs:
+            self.obstacles_pos = obs["obstacles_pos"].copy()
+            if self.step_count % 50 == 0 and len(self.obstacles_pos) > 0:
+                print(f"[AttitudeMPPI] Tracking {len(self.obstacles_pos)} obstacles")
+                for i, obs_pos in enumerate(self.obstacles_pos):
+                    print(f"  Obstacle {i}: [{obs_pos[0]:.2f}, {obs_pos[1]:.2f}, {obs_pos[2]:.2f}]")
+
+        # Update live gate pose for current target gate index (will be refined below if index changes)
+        try:
+            self.current_gate_center = np.array(obs["gates_pos"][int(obs["target_gate"])], dtype=float)
+            self.current_gate_quat = np.array(obs["gates_quat"][int(obs["target_gate"])], dtype=float)
+        except Exception:
+            # Fallback to previously cached values
+            pass
 
         # Update target gate if necessary
         new_target_idx = int(obs["target_gate"])
@@ -309,6 +434,12 @@ class AttitudeMPPIController(Controller):
             initial_control = torch.zeros((self.mppi_horizon, 4), dtype=self.dtype, device=self.device)
             initial_control[:, 3] = self.hover_thrust
             self.mppi.U = initial_control
+            # Update live gate pose after index change
+            try:
+                self.current_gate_center = np.array(obs["gates_pos"][self.target_gate_idx], dtype=float)
+                self.current_gate_quat = np.array(obs["gates_quat"][self.target_gate_idx], dtype=float)
+            except Exception:
+                pass
         else:
             # Check if goal position has changed even if index stays the same
             new_goal = obs["gates_pos"][self.target_gate_idx]
@@ -327,6 +458,19 @@ class AttitudeMPPIController(Controller):
                 initial_control = torch.zeros((self.mppi_horizon, 4), dtype=self.dtype, device=self.device)
                 initial_control[:, 3] = self.hover_thrust
                 self.mppi.U = initial_control
+                # Update live gate pose after goal update
+                try:
+                    self.current_gate_center = np.array(obs["gates_pos"][self.target_gate_idx], dtype=float)
+                    self.current_gate_quat = np.array(obs["gates_quat"][self.target_gate_idx], dtype=float)
+                except Exception:
+                    pass
+
+        # Ensure live pose is aligned with the final target index for this step
+        try:
+            self.current_gate_center = np.array(obs["gates_pos"][self.target_gate_idx], dtype=float)
+            self.current_gate_quat = np.array(obs["gates_quat"][self.target_gate_idx], dtype=float)
+        except Exception:
+            pass
 
         # Convert observation to state tensor
         state = self.drone_model.obs_to_state(obs)
@@ -354,12 +498,21 @@ class AttitudeMPPIController(Controller):
             z_offset = pos[2] - gate_pos[2]
             xy_dist = np.linalg.norm(pos[:2] - gate_pos[:2])
             speed = np.linalg.norm(vel)
+            
+            # Check proximity to obstacles
+            obstacle_proximity = float('inf')
+            if len(self.obstacles_pos) > 0:
+                # Calculate distance to nearest obstacle
+                distances = np.linalg.norm(pos - self.obstacles_pos, axis=1)
+                obstacle_proximity = np.min(distances) - self.obstacle_radius
+                
             print(f"[AttitudeMPPI] Step {self.step_count:4d} | "
                   f"G{self.target_gate_idx} | "
                   f"Pos:[{pos[0]:5.2f},{pos[1]:5.2f},{pos[2]:5.2f}] | "
                   f"3D:{dist_to_gate:4.2f}m XY:{xy_dist:4.2f}m ΔZ:{z_offset:+.2f}m | "
                   f"V:{speed:.1f}m/s | "
-                  f"T:{control_np[3]:.2f}N")
+                  f"T:{control_np[3]:.2f}N | "
+                  f"Obs:{obstacle_proximity:.2f}m")
         # print(f"[AttitudeMPPI] Computation time: {time() - curr_time:.4f}s")
         return control_np
 
@@ -385,5 +538,22 @@ class AttitudeMPPIController(Controller):
         # Reset step counter and previous control
         self.step_count = 0
         self.prev_control = None
+        self.obstacles_pos = np.array([])
         
         print("[AttitudeMPPI] Episode reset")
+
+    # def get_planned_trajectory(self) -> np.ndarray:
+    #     """Get the optimal planned trajectory from the last MPPI optimization.
+        
+    #     Returns:
+    #         Array of shape (T, 3) containing the planned position trajectory
+    #     """
+    #     if hasattr(self.mppi, 'states') and self.mppi.states is not None:
+    #         # Extract from MPPI states
+    #         states = self.mppi.states
+    #         if states is not None and states.shape[1] > 0:
+    #             traj = states[0, 0].cpu().numpy()[:, 0:3]  # First sample, position only
+    #             return traj
+        
+    #     # Fallback: Return empty array
+    #     return np.array([])

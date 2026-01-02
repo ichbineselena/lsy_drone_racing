@@ -33,7 +33,8 @@ drone_model = "cf21B_500"                        # Model of the drone, i.e., cf2
 camera_view = [5.0, 180.0, -25.0, 0.0, 0.0, 0.0] # Camera view [distance, azimuth, elevation, lookat_x, lookat_y, lookat_z]
 freq = 500                                        # Simulation frequency, in Hz
 attitude_freq = 500                               # Controller frequency, in Hz. This frequency is used to simulate the onboard controller, NOT for the environment's step function
-render = false                                       # Enable/disable PyBullet's GUI
+render = false                                    # Enable/disable PyBullet's GUI
+visualize = true                                  # Enable/disable visualization o the drone's path, obstacles pols, gates openings and the goal
 
 
 [env]
@@ -65,13 +66,13 @@ rpy = [0.0, 0.0, 0.0]
 
 # Obstacle height: 1.52m + reflective marker on top. Height is measured from the ground to the top of the obstacle.
 [[env.track.obstacles]]
-pos = [0.0, 1.75, 1.55]
+pos = [0.0, 0.75, 1.55]
 [[env.track.obstacles]]
-pos = [1.0, 1.25, 1.55]
+pos = [1.0, 0.25, 1.55]
 [[env.track.obstacles]]
-pos = [-1.5, -1.25, 1.55]
+pos = [-1.5, -0.25, 1.55]
 [[env.track.obstacles]]
-pos = [-0.5, -1.75, 1.55]
+pos = [-0.5, -0.75, 1.55]
 
 [[env.track.drones]]
 pos = [-1.5, 0.75, 0.01]
