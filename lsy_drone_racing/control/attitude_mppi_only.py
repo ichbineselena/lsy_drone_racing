@@ -52,12 +52,12 @@ class AttitudeMPPIController(Controller):
         # MPPI hyperparameters - optimized for robust trajectory optimization
         self.mppi_horizon = 25  # Planning horizon steps (proven stable for 4-gate success)
         self.mppi_dt = self._dt * 2  # 0.04s time discretization
-        self.num_samples = 3000  # Stable optimization quality
+        self.num_samples = 6000  # Stable optimization quality
         self.lambda_weight = 9.5  # Temperature parameter tuned for improved transitions
         
         # Gate geometry constants
-        self.gate_opening = 0.30  # 30cm square opening
-        self.gate_frame_thickness = 0.045  # 4.5cm frame
+        self.gate_opening = 0.345 #0.375 #0.405  # 40.5cm square opening
+        self.gate_frame_thickness = 0.2 #0.185 #0.17  # 17cm frame
         
         # Obstacle geometry constants (from MuJoCo model)
         self.obstacle_radius = 0.015  # 1.5cm radius
@@ -318,7 +318,7 @@ class AttitudeMPPIController(Controller):
         # Opening and frame geometry
         opening_half = self.gate_opening / 2.0  # 0.15 m
         frame_t = self.gate_frame_thickness      # 0.045 m
-        edge_offset = opening_half + frame_t * 0.5
+        edge_offset = opening_half + frame_t #* 0.5
         safety_r = 0.05  # keep ~5cm away from frames
 
         # Attraction: encourage being inside opening box in gate plane
@@ -451,7 +451,7 @@ class AttitudeMPPIController(Controller):
                 gate_quat = obs["gates_quat"][self.target_gate_idx]
                 rot = R.from_quat(gate_quat)
                 forward = rot.as_matrix()[:, 0]
-                self.goal = self.goal + 0.0 * forward
+                self.goal = self.goal + 0.08 * forward
                 print(f"\n[AttitudeMPPI] Goal position updated (same gate {self.target_gate_idx}): {self.goal}")
                 
                 # Reset control sequence on goal position change
