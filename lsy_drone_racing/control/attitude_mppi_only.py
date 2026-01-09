@@ -110,7 +110,8 @@ class AttitudeMPPIController(Controller):
         self.current_gate_center = np.array(obs["gates_pos"][self.target_gate_idx], dtype=float)
         self.current_gate_quat = np.array(obs["gates_quat"][self.target_gate_idx], dtype=float)
         
-        # Store obstacles information
+        # Flag to track if goal has been shifted for current gate
+        self.goal_shifted = False
         self.obstacles_pos = obs["obstacles_pos"].copy() if "obstacles_pos" in obs else np.array([])
 
         # More conservative control limits
@@ -416,24 +417,24 @@ class AttitudeMPPIController(Controller):
             # Fallback to previously cached values
             pass
 
-        # Update target gate if necessary
+        # Goal update logic with 3 cases
         new_target_idx = int(obs["target_gate"])
+        drone_pos = np.array(obs["pos"], dtype=float)
+        
+        # CASE 1: Target index changed
         if new_target_idx != self.target_gate_idx:
             self.old_gate_pos = self.gates_pos[self.target_gate_idx]
             self.target_gate_idx = new_target_idx
             self.prev_goal = self.goal.copy()
-            self.goal = self.gates_pos[self.target_gate_idx]
-            # small forward offset through the gate
-            gate_quat = obs["gates_quat"][self.target_gate_idx]
-            rot = R.from_quat(gate_quat)
-            forward = rot.as_matrix()[:, 0]
-            self.goal = self.goal + 0.0 * forward
-            print(f"\n[AttitudeMPPI] Updated target to gate {self.target_gate_idx}")
+            self.goal = self.gates_pos[self.target_gate_idx].copy()
+            self.goal_shifted = False  # Reset flag for new gate
+            print(f"\n[AttitudeMPPI] Case 1: Updated target to gate {self.target_gate_idx}")
             
             # Reset control sequence on gate change
             initial_control = torch.zeros((self.mppi_horizon, 4), dtype=self.dtype, device=self.device)
             initial_control[:, 3] = self.hover_thrust
             self.mppi.U = initial_control
+            
             # Update live gate pose after index change
             try:
                 self.current_gate_center = np.array(obs["gates_pos"][self.target_gate_idx], dtype=float)
@@ -441,29 +442,51 @@ class AttitudeMPPIController(Controller):
             except Exception:
                 pass
         else:
-            # Check if goal position has changed even if index stays the same
-            new_goal = obs["gates_pos"][self.target_gate_idx]
-            if np.any(new_goal != self.old_gate_pos):
-                self.old_gate_pos = new_goal.copy()
+            # CASE 2: Same index, but gate position given more precisely
+            new_gate_pos = np.array(obs["gates_pos"][self.target_gate_idx], dtype=float)
+            if np.any(new_gate_pos != self.old_gate_pos):
+                self.old_gate_pos = new_gate_pos.copy()
                 self.prev_goal = self.goal.copy()
-                self.goal = new_goal.copy()
-                # small forward offset through the gate
-                gate_quat = obs["gates_quat"][self.target_gate_idx]
-                rot = R.from_quat(gate_quat)
-                forward = rot.as_matrix()[:, 0]
-                self.goal = self.goal + 0.08 * forward
-                print(f"\n[AttitudeMPPI] Goal position updated (same gate {self.target_gate_idx}): {self.goal}")
+                self.goal = new_gate_pos.copy()
+                self.goal_shifted = False  # Reset flag on gate position update
+                print(f"\n[AttitudeMPPI] Case 2: Gate position updated (gate {self.target_gate_idx})")
                 
                 # Reset control sequence on goal position change
                 initial_control = torch.zeros((self.mppi_horizon, 4), dtype=self.dtype, device=self.device)
                 initial_control[:, 3] = self.hover_thrust
                 self.mppi.U = initial_control
+                
                 # Update live gate pose after goal update
                 try:
                     self.current_gate_center = np.array(obs["gates_pos"][self.target_gate_idx], dtype=float)
                     self.current_gate_quat = np.array(obs["gates_quat"][self.target_gate_idx], dtype=float)
                 except Exception:
                     pass
+            
+            # CASE 3: Drone is within 5cm before the gate opening plane, move goal forward (only once)
+            # Calculate signed distance from drone to gate plane (along gate normal)
+            gate_rot = R.from_quat(self.current_gate_quat)
+            gate_normal = gate_rot.as_matrix()[:, 0]  # X-axis is the normal to the opening plane
+            
+            rel_pos = drone_pos - self.current_gate_center
+            dist_to_plane = np.dot(rel_pos, gate_normal)  # Signed distance along normal (negative = before the plane)
+            
+            if not self.goal_shifted and -0.05 < dist_to_plane < 0:  # Within 5cm before gate, and not yet shifted
+                self.goal_shifted = True  # Mark that we've shifted for this gate
+                self.prev_goal = self.goal.copy()
+                # Get forward direction from gate rotation
+                gate_quat = np.array(obs["gates_quat"][self.target_gate_idx], dtype=float)
+                rot = R.from_quat(gate_quat)
+                forward = rot.as_matrix()[:, 0]
+                # Move goal 8cm forward
+                self.goal = self.goal + 0.08 * forward
+                print(f"\n[AttitudeMPPI] Case 3: Drone within 5cm before gate (dist={dist_to_plane:.3f}m), "
+                      f"shifting goal forward to: {self.goal}")
+                
+                # Reset control sequence on goal progression
+                initial_control = torch.zeros((self.mppi_horizon, 4), dtype=self.dtype, device=self.device)
+                initial_control[:, 3] = self.hover_thrust
+                self.mppi.U = initial_control
 
         # Ensure live pose is aligned with the final target index for this step
         try:
@@ -542,18 +565,87 @@ class AttitudeMPPIController(Controller):
         
         print("[AttitudeMPPI] Episode reset")
 
-    # def get_planned_trajectory(self) -> np.ndarray:
-    #     """Get the optimal planned trajectory from the last MPPI optimization.
+    def get_optimal_trajectory(self, obs: dict) -> np.ndarray:
+        """Get the optimal MPPI trajectory from current observation.
         
-    #     Returns:
-    #         Array of shape (T, 3) containing the planned position trajectory
-    #     """
-    #     if hasattr(self.mppi, 'states') and self.mppi.states is not None:
-    #         # Extract from MPPI states
-    #         states = self.mppi.states
-    #         if states is not None and states.shape[1] > 0:
-    #             traj = states[0, 0].cpu().numpy()[:, 0:3]  # First sample, position only
-    #             return traj
+        This simulates forward using the optimal control sequence (mppi.U),
+        which represents the TRUE optimal trajectory (weighted combination of all samples).
         
-    #     # Fallback: Return empty array
-    #     return np.array([])
+        Args:
+            obs: Current observation dictionary
+            
+        Returns:
+            Array of shape (T, 3) containing the planned position trajectory
+        """
+        try:
+            # Convert observation to state tensor
+            current_state = self.drone_model.obs_to_state(obs)
+            
+            # Ensure state is batched (shape [1, nx])
+            if current_state.ndim == 1:
+                current_state = current_state.unsqueeze(0)
+            
+            # Get optimal control sequence (weighted average from MPPI)
+            optimal_controls = self.mppi.U  # Shape: [T, 4]
+            
+            # Simulate trajectory forward (keep everything batched)
+            state_tensor = current_state.clone()  # Shape: [1, nx]
+            trajectory_positions = [state_tensor[0, 0:3].cpu().numpy()]  # Extract position only
+            
+            for t in range(min(self.mppi_horizon, 25)):  # Limit to 25 steps for visibility
+                control_t = optimal_controls[t].unsqueeze(0)  # Shape: [1, 4]
+                state_tensor = self.drone_model.dynamics(
+                    state_tensor, 
+                    control_t, 
+                    self.mppi_dt
+                )
+                # Ensure result is batched
+                if state_tensor.ndim == 1:
+                    state_tensor = state_tensor.unsqueeze(0)
+                # Extract position (first 3 elements) and store
+                trajectory_positions.append(state_tensor[0, 0:3].cpu().numpy())
+            
+            # Convert list to numpy array
+            pos_traj = np.array(trajectory_positions)  # Shape: [T, 3]
+            return pos_traj
+        except Exception as e:
+            print(f"[AttitudeMPPI] Error computing optimal trajectory: {e}")
+            import traceback
+            traceback.print_exc()
+            return np.array([])
+
+    def get_planned_trajectory(self) -> np.ndarray:
+        """Get the optimal planned trajectory from the last MPPI optimization.
+        
+        Returns:
+            Array of shape (T, 3) containing the planned position trajectory
+        """
+        try:
+            # Simulate forward using the optimal control sequence (mppi.U)
+            # This represents the TRUE optimal trajectory (weighted combination of all samples)
+            current_state = self.mppi.U.new_zeros(1, self.drone_model.nx)
+            # Note: This returns trajectory from zero state. For actual state, need to pass obs.
+            # Better to get from sim.py where we have access to current obs.
+            
+            # Get optimal control sequence
+            optimal_controls = self.mppi.U  # Shape: [T, 4]
+            
+            # Simulate trajectory forward
+            trajectory = []
+            state_tensor = current_state.clone()
+            
+            for t in range(min(self.mppi_horizon, 25)):
+                trajectory.append(state_tensor.clone())
+                control_t = optimal_controls[t].unsqueeze(0)
+                state_tensor = self.drone_model.dynamics(
+                    state_tensor, 
+                    control_t, 
+                    self.mppi_dt
+                )
+            
+            # Convert to numpy array
+            trajectory_np = torch.cat(trajectory, dim=0).cpu().numpy()
+            pos_traj = trajectory_np[:, 0:3]
+            return pos_traj
+        except Exception:
+            return np.array([])

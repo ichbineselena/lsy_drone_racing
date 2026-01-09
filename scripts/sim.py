@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 def simulate(
-    config: str = "level3.toml",
+    config: str = "level2.toml",
     controller: str | None = None,
     n_runs: int = 1,
     render: bool | None = None,
@@ -221,70 +221,32 @@ def simulate(
             
             # --- Draw optimal MPPI trajectory ---
             if config.sim.visualize:
-                try:
-                    if hasattr(controller, 'mppi'):
-                        # Get the optimal control sequence and simulate forward
-                        mppi = controller.mppi
+                if hasattr(controller, 'get_optimal_trajectory'):
+                    # Get the optimal trajectory from the controller
+                    # This is the TRUE optimal trajectory (weighted combination of all samples)
+                    pos_traj = controller.get_optimal_trajectory(obs)
+                    
+                    # Draw the simulated optimal trajectory
+                    if len(pos_traj) > 1:
+                        # Filter out consecutive duplicate points to avoid numerical issues
+                        filtered_traj = [pos_traj[0]]
+                        for i in range(1, len(pos_traj)):
+                            # Only add point if it's sufficiently different from the last
+                            if np.linalg.norm(pos_traj[i] - filtered_traj[-1]) > 0.001:  # 1mm threshold
+                                filtered_traj.append(pos_traj[i])
                         
-                        # The optimal trajectory is stored in mppi.U (control sequence)
-                        # We need to simulate the dynamics forward to get the state trajectory
-                        if hasattr(mppi, 'states') and mppi.states is not None:
-                            # Get the optimal trajectory from the last MPPI iteration
-                            # states shape: [1, K, T, nx] where nx=12
-                            states = mppi.states
-                            if states is not None:
-                                # Get the optimal trajectory (first sample is the nominal)
-                                states_np = states[0, 0].cpu().numpy()  # Shape: [T, nx]
-                                
-                                # Extract position coordinates (first 3 columns)
-                                pos_traj = states_np[:, 0:3]
-                                
-                                # Draw the optimal trajectory as a cyan line
-                                if len(pos_traj) > 1:
-                                    draw_line(
-                                        env,
-                                        pos_traj,
-                                        rgba=np.array([0.0, 1.0, 1.0, 1.0]),  # Cyan color
-                                        min_size=2.0,
-                                        max_size=4.0,
-                                    )
-                        else:
-                            # Fallback: Simulate forward using current state and optimal controls
-                            import torch
-                            current_state = controller.drone_model.obs_to_state(obs)
-                            
-                            # Get optimal control sequence
-                            optimal_controls = mppi.U  # Shape: [T, 4]
-                            
-                            # Simulate trajectory forward
-                            state_tensor = current_state.clone()
-                            trajectory = [state_tensor.clone()]
-                            
-                            for t in range(min(controller.mppi_horizon, 25)):  # Limit to 25 steps for visibility
-                                control_t = optimal_controls[t].unsqueeze(0)
-                                state_tensor = controller.drone_model.dynamics(
-                                    state_tensor, 
-                                    control_t, 
-                                    controller.mppi_dt
-                                )
-                                trajectory.append(state_tensor.clone())
-                            
-                            # Convert to numpy array
-                            trajectory_np = torch.cat(trajectory, dim=0).cpu().numpy()
-                            pos_traj = trajectory_np[:, 0:3]
-                            
-                            # Draw the simulated optimal trajectory
-                            if len(pos_traj) > 1:
+                        if len(filtered_traj) > 1:
+                            try:
                                 draw_line(
                                     env,
-                                    pos_traj,
+                                    np.array(filtered_traj),
                                     rgba=np.array([0.0, 1.0, 1.0, 0.8]),  # Semi-transparent cyan
                                     min_size=2.0,
                                     max_size=4.0,
                                 )
-                except Exception as e:
-                    # Silently fail - visualization shouldn't break the simulation
-                    pass
+                            except (np.linalg.LinAlgError, RuntimeWarning):
+                                # Skip drawing if numerical issues occur
+                                pass
 
                 # Draw planned trajectory from controller (if provided).
                 # Controllers may expose a `get_planned_trajectory()` method returning an (N,3) array
