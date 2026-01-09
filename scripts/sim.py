@@ -21,6 +21,9 @@ from gymnasium.wrappers.jax_to_numpy import JaxToNumpy
 
 from lsy_drone_racing.utils import load_config, load_controller, draw_line, draw_point, draw_capsule, draw_box
 
+# Import after lsy_drone_racing to avoid SCIPY_ARRAY_API issues
+from scipy.spatial.transform import Rotation as R
+
 if TYPE_CHECKING:
     from ml_collections import ConfigDict
 
@@ -112,108 +115,148 @@ def simulate(
                                     end=top,
                                     radius=controller.obstacle_radius + controller.obstacle_safety_margin,
                                     color=(0.0, 1.0, 1.0, 0.4),  # Cyan with transparency
-                                    segments=12
+                                    segments=6
                                 )
                                 
-                                # Draw actual obstacle size (gray)
-                                draw_capsule(
+                                # Draw pole line for obstacle (red)
+                                draw_line(
                                     env,
-                                    start=bottom,
-                                    end=top,
-                                    radius=controller.obstacle_radius,
-                                    color=(0.5, 0.5, 0.5, 0.7),  # Gray for actual size
-                                    segments=12
+                                    np.array([bottom, top]),
+                                    rgba=np.array([1.0, 0.0, 0.0, 1.0]),  # Red for obstacle axis
+                                    min_size=2.0,
+                                    max_size=2.0
                                 )
                     
-                    # 3. Draw current gate frame modeling
-                    if hasattr(controller, 'current_gate_center') and hasattr(controller, 'current_gate_quat'):
+                    # 3. Draw ALL gate frames modeling (not just current target)
+                    if hasattr(controller, 'gates_pos') and hasattr(controller, 'gates_quat'):
                         if hasattr(controller, 'gate_opening') and hasattr(controller, 'gate_frame_thickness'):
-                            # Draw gate opening box
                             half_opening = controller.gate_opening / 2.0
-                            half_sizes = np.array([0.01, half_opening, half_opening])  # Thin in x direction
-                            draw_box(
-                                env,
-                                center=controller.current_gate_center,
-                                quat=controller.current_gate_quat,
-                                half_sizes=half_sizes,
-                                color=(0.0, 1.0, 0.0, 0.3)  # Green for opening
-                            )
-                            
-                            # Draw gate frames
-                            rot = R.from_quat(controller.current_gate_quat)
-                            R_matrix = rot.as_matrix()
+                            frame_safety_margin = 0.05  # 5cm safety margin matching controller
+                            frame_radius = controller.gate_frame_thickness / 2.0
+                            frame_radius_with_margin = frame_radius + frame_safety_margin
                             total_half = half_opening + controller.gate_frame_thickness / 2.0
                             
-                            # Define frame positions
-                            # Left vertical frame
-                            left_center_local = np.array([0, -total_half, 0])
-                            left_center_world = controller.current_gate_center + R_matrix @ left_center_local
-                            left_top = left_center_world + R_matrix @ np.array([0, 0, half_opening])
-                            left_bottom = left_center_world - R_matrix @ np.array([0, 0, half_opening])
+                            # Get live gate poses if available
+                            if "gates_pos" in obs and "gates_quat" in obs:
+                                gates_pos_live = obs["gates_pos"]
+                                gates_quat_live = obs["gates_quat"]
+                            else:
+                                gates_pos_live = controller.gates_pos
+                                gates_quat_live = controller.gates_quat
                             
-                            draw_capsule(
-                                env,
-                                start=left_top,
-                                end=left_bottom,
-                                radius=controller.gate_frame_thickness / 2.0,
-                                color=(1.0, 1.0, 0.0, 0.6),  # Yellow for frame
-                                segments=8
-                            )
-                            
-                            # Right vertical frame
-                            right_center_local = np.array([0, total_half, 0])
-                            right_center_world = controller.current_gate_center + R_matrix @ right_center_local
-                            right_top = right_center_world + R_matrix @ np.array([0, 0, half_opening])
-                            right_bottom = right_center_world - R_matrix @ np.array([0, 0, half_opening])
-                            
-                            draw_capsule(
-                                env,
-                                start=right_top,
-                                end=right_bottom,
-                                radius=controller.gate_frame_thickness / 2.0,
-                                color=(1.0, 1.0, 0.0, 0.6),
-                                segments=8
-                            )
-                            
-                            # Top horizontal frame
-                            top_center_local = np.array([0, 0, total_half])
-                            top_center_world = controller.current_gate_center + R_matrix @ top_center_local
-                            top_left = top_center_world - R_matrix @ np.array([0, half_opening, 0])
-                            top_right = top_center_world + R_matrix @ np.array([0, half_opening, 0])
-                            
-                            draw_capsule(
-                                env,
-                                start=top_left,
-                                end=top_right,
-                                radius=controller.gate_frame_thickness / 2.0,
-                                color=(1.0, 1.0, 0.0, 0.6),
-                                segments=8
-                            )
-                            
-                            # Bottom horizontal frame
-                            bottom_center_local = np.array([0, 0, -total_half])
-                            bottom_center_world = controller.current_gate_center + R_matrix @ bottom_center_local
-                            bottom_left = bottom_center_world - R_matrix @ np.array([0, half_opening, 0])
-                            bottom_right = bottom_center_world + R_matrix @ np.array([0, half_opening, 0])
-                            
-                            draw_capsule(
-                                env,
-                                start=bottom_left,
-                                end=bottom_right,
-                                radius=controller.gate_frame_thickness / 2.0,
-                                color=(1.0, 1.0, 0.0, 0.6),
-                                segments=8
-                            )
-                            
-                            # Draw gate normal vector
-                            normal_end = controller.current_gate_center + R_matrix[:, 0] * 0.3
-                            draw_line(
-                                env,
-                                np.array([controller.current_gate_center, normal_end]),
-                                rgba=np.array([0.0, 0.0, 1.0, 1.0]),
-                                min_size=1.0,
-                                max_size=1.0
-                            )
+                            # Iterate over all gates
+                            for gate_idx in range(len(controller.gates_pos)):
+                                gate_center = np.array(gates_pos_live[gate_idx], dtype=float)
+                                gate_quat = np.array(gates_quat_live[gate_idx], dtype=float)
+                                rot = R.from_quat(gate_quat)
+                                R_matrix = rot.as_matrix()
+                                
+                                # Use different colors for current target vs other gates
+                                is_target = hasattr(controller, 'target_gate_idx') and gate_idx == controller.target_gate_idx
+                                if is_target:
+                                    vert_color = (0.0, 1.0, 1.0, 0.4)  # Cyan for target gate
+                                    horiz_color = (1.0, 0.5, 0.0, 0.5)  # Orange for target gate
+                                    line_color = np.array([1.0, 0.0, 1.0, 1.0])  # Magenta for target
+                                else:
+                                    vert_color = (0.5, 0.5, 1.0, 0.25)  # Light blue for other gates
+                                    horiz_color = (1.0, 0.7, 0.3, 0.25)  # Light orange for other gates
+                                    line_color = np.array([0.6, 0.3, 0.6, 0.7])  # Dim magenta for others
+                                
+                                # Draw gate opening box (only for target)
+                                if is_target:
+                                    half_sizes = np.array([0.01, half_opening, half_opening])
+                                    draw_box(
+                                        env,
+                                        center=gate_center,
+                                        quat=gate_quat,
+                                        half_sizes=half_sizes,
+                                        color=(0.0, 1.0, 0.0, 0.3)  # Green for opening
+                                    )
+                                
+                                # Left vertical frame (pole)
+                                left_center_local = np.array([0, -total_half, 0])
+                                left_center_world = gate_center + R_matrix @ left_center_local
+                                left_top = left_center_world + R_matrix @ np.array([0, 0, half_opening])
+                                left_bottom = left_center_world - R_matrix @ np.array([0, 0, half_opening])
+                                
+                                draw_capsule(
+                                    env,
+                                    start=left_top,
+                                    end=left_bottom,
+                                    radius=frame_radius_with_margin,
+                                    color=vert_color,
+                                    segments=4
+                                )
+                                draw_line(
+                                    env,
+                                    np.array([left_bottom, left_top]),
+                                    rgba=line_color,
+                                    min_size=2.0,
+                                    max_size=2.0
+                                )
+                                
+                                # Right vertical frame (pole)
+                                right_center_local = np.array([0, total_half, 0])
+                                right_center_world = gate_center + R_matrix @ right_center_local
+                                right_top = right_center_world + R_matrix @ np.array([0, 0, half_opening])
+                                right_bottom = right_center_world - R_matrix @ np.array([0, 0, half_opening])
+                                
+                                draw_capsule(
+                                    env,
+                                    start=right_top,
+                                    end=right_bottom,
+                                    radius=frame_radius_with_margin,
+                                    color=vert_color,
+                                    segments=4
+                                )
+                                draw_line(
+                                    env,
+                                    np.array([right_bottom, right_top]),
+                                    rgba=line_color,
+                                    min_size=2.0,
+                                    max_size=2.0
+                                )
+                                
+                                # Top horizontal frame (capsule)
+                                top_center_local = np.array([0, 0, total_half])
+                                top_center_world = gate_center + R_matrix @ top_center_local
+                                top_left = top_center_world - R_matrix @ np.array([0, half_opening, 0])
+                                top_right = top_center_world + R_matrix @ np.array([0, half_opening, 0])
+                                
+                                draw_capsule(
+                                    env,
+                                    start=top_left,
+                                    end=top_right,
+                                    radius=frame_radius_with_margin,
+                                    color=horiz_color,
+                                    segments=4
+                                )
+                                
+                                # Bottom horizontal frame (capsule)
+                                bottom_center_local = np.array([0, 0, -total_half])
+                                bottom_center_world = gate_center + R_matrix @ bottom_center_local
+                                bottom_left = bottom_center_world - R_matrix @ np.array([0, half_opening, 0])
+                                bottom_right = bottom_center_world + R_matrix @ np.array([0, half_opening, 0])
+                                
+                                draw_capsule(
+                                    env,
+                                    start=bottom_left,
+                                    end=bottom_right,
+                                    radius=frame_radius_with_margin,
+                                    color=horiz_color,
+                                    segments=4
+                                )
+                                
+                                # Draw gate normal vector (only for target)
+                                if is_target:
+                                    normal_end = gate_center + R_matrix[:, 0] * 0.3
+                                    draw_line(
+                                        env,
+                                        np.array([gate_center, normal_end]),
+                                        rgba=np.array([0.0, 0.0, 1.0, 1.0]),
+                                        min_size=1.0,
+                                        max_size=1.0
+                                    )
                     
                 except Exception as e:
                     # Silently fail - visualization shouldn't break the simulation

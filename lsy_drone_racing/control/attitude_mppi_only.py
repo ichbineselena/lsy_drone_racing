@@ -56,8 +56,8 @@ class AttitudeMPPIController(Controller):
         self.lambda_weight = 9.5  # Temperature parameter tuned for improved transitions
         
         # Gate geometry constants
-        self.gate_opening = 0.345 #0.375 #0.405  # 40.5cm square opening
-        self.gate_frame_thickness = 0.2 #0.185 #0.17  # 17cm frame
+        self.gate_opening = 0.40 #0.345 #0.375 #0.405  # 40.5cm square opening
+        self.gate_frame_thickness = 0.17 #0.05 #0.2 #0.185 #0.17  # 17cm frame
         
         # Obstacle geometry constants (from MuJoCo model)
         self.obstacle_radius = 0.015  # 1.5cm radius
@@ -276,6 +276,93 @@ class AttitudeMPPIController(Controller):
         
         return total_cost
 
+    def compute_all_gates_avoidance_cost(
+        self,
+        pos: torch.Tensor,
+        obs: dict | None = None
+    ) -> torch.Tensor:
+        """Compute gate frame avoidance cost for ALL gates (not just current target).
+        
+        This prevents the drone from colliding with gates it has already passed
+        or gates it will pass in the future.
+        
+        Args:
+            pos: Position tensor of shape (..., 3)
+            obs: Current observation dict (optional, for live gate poses)
+            
+        Returns:
+            Gate avoidance cost tensor of shape (...)
+        """
+        # Initialize total gate avoidance cost
+        total_gate_cost = torch.zeros(pos.shape[:-1], dtype=self.dtype, device=self.device)
+        
+        # Gate geometry
+        opening_half = self.gate_opening / 2.0
+        frame_t = self.gate_frame_thickness
+        edge_offset = opening_half + frame_t
+        safety_r = 0.05  # 5cm safety margin for all gates
+        
+        # Weights for gate frame avoidance (slightly lower than target gate to prioritize target)
+        w_vert_all = 150.0  # Vertical frame weight
+        w_horiz_all = 120.0  # Horizontal frame weight
+        
+        # Get live gate poses if available
+        if obs is not None and "gates_pos" in obs and "gates_quat" in obs:
+            gates_pos_live = obs["gates_pos"]
+            gates_quat_live = obs["gates_quat"]
+        else:
+            gates_pos_live = self.gates_pos
+            gates_quat_live = self.gates_quat
+        
+        # Iterate over all gates
+        for gate_idx in range(len(self.gates_pos)):
+            # Get gate pose
+            gate_center_np = np.array(gates_pos_live[gate_idx], dtype=float)
+            gate_quat_np = np.array(gates_quat_live[gate_idx], dtype=float)
+            gate_R_np = R.from_quat(gate_quat_np).as_matrix()
+            
+            gate_R = torch.tensor(gate_R_np, dtype=self.dtype, device=self.device)
+            gate_center = torch.tensor(gate_center_np, dtype=self.dtype, device=self.device)
+            
+            # Transform position into gate-local coordinates
+            rel = pos - gate_center
+            x_n = torch.sum(rel * gate_R[:, 0], dim=-1)  # Normal direction
+            y_p = torch.sum(rel * gate_R[:, 1], dim=-1)  # Lateral direction
+            z_p = torch.sum(rel * gate_R[:, 2], dim=-1)  # Vertical direction
+            
+            # Only apply avoidance when drone is near the gate plane (within 0.8m)
+            near_gate = torch.abs(x_n) < 0.8
+            
+            # Vertical frames: poles at y = ±edge_offset
+            dy_left = torch.abs(y_p + edge_offset)
+            dy_right = torch.abs(y_p - edge_offset)
+            
+            # Penalty when closer than safety_r to vertical frames
+            c_vert_left = torch.clamp(safety_r - dy_left, min=0.0) ** 2
+            c_vert_right = torch.clamp(safety_r - dy_right, min=0.0) ** 2
+            c_vert = w_vert_all * (c_vert_left + c_vert_right)
+            
+            # Horizontal frames: capsules at z = ±edge_offset (within lateral span)
+            dz_top = torch.abs(z_p - edge_offset)
+            dz_bottom = torch.abs(z_p + edge_offset)
+            within_span = torch.abs(y_p) <= (opening_half + frame_t + 0.1)  # Slightly wider check
+            
+            c_horiz_top = torch.clamp(safety_r - dz_top, min=0.0) ** 2
+            c_horiz_bottom = torch.clamp(safety_r - dz_bottom, min=0.0) ** 2
+            c_horiz = torch.where(
+                within_span,
+                w_horiz_all * (c_horiz_top + c_horiz_bottom),
+                torch.zeros_like(dz_top)
+            )
+            
+            # Apply cost only when near the gate plane
+            gate_cost = torch.where(near_gate, c_vert + c_horiz, torch.zeros_like(c_vert))
+            
+            # Add to total
+            total_gate_cost = total_gate_cost + gate_cost
+        
+        return total_gate_cost
+
     def compute_running_cost(
         self,
         state: torch.Tensor,
@@ -320,7 +407,7 @@ class AttitudeMPPIController(Controller):
         opening_half = self.gate_opening / 2.0  # 0.15 m
         frame_t = self.gate_frame_thickness      # 0.045 m
         edge_offset = opening_half + frame_t #* 0.5
-        safety_r = 0.05  # keep ~5cm away from frames
+        safety_r = 0.0 #0.1  # keep ~10cm away from frames
 
         # Attraction: encourage being inside opening box in gate plane
         # Hinge loss if outside opening in y or z
@@ -338,7 +425,7 @@ class AttitudeMPPIController(Controller):
         # Penalize inverse-square proximity inside safety radius
         dy_left = torch.abs(y_p + edge_offset)
         dy_right = torch.abs(y_p - edge_offset)
-        w_vert = 120.0
+        w_vert = 240.0 #120.0
         c_vert = w_vert * (torch.clamp(safety_r - dy_left, min=0.0) ** 2 + torch.clamp(safety_r - dy_right, min=0.0) ** 2)
 
         # Obstacle avoidance: horizontal frames modeled as capsules along y at z=±edge_offset
@@ -346,7 +433,7 @@ class AttitudeMPPIController(Controller):
         dz_bottom = torch.abs(z_p + edge_offset)
         # Active only when within lateral span around the gate opening (|y| <= opening_half + frame_t)
         within_span = torch.abs(y_p) <= (opening_half + frame_t)
-        w_horiz = 100.0
+        w_horiz = 200.0 #100.0
         c_horiz = torch.where(within_span, w_horiz * (torch.clamp(safety_r - dz_top, min=0.0) ** 2 + torch.clamp(safety_r - dz_bottom, min=0.0) ** 2), torch.zeros_like(dz_top))
 
         c_gate_struct = c_open_hinge + c_center + c_vert + c_horiz
@@ -372,9 +459,12 @@ class AttitudeMPPIController(Controller):
         
         # 5. Obstacle avoidance cost
         c_obstacle = self.compute_obstacle_cost(pos)
+        
+        # 6. All gates avoidance cost (prevents collision with passed/future gates)
+        c_all_gates = self.compute_all_gates_avoidance_cost(pos)
 
-        # Total cost (simplified) + gate structure shaping and risk-aware slowdown
-        total_cost = c_pos + c_vel + c_att + c_z_floor + c_gate_struct + c_slow + c_obstacle
+        # Total cost (simplified) + gate structure shaping and risk-aware slowdown + all gates avoidance
+        total_cost = c_pos + c_vel + c_att + c_z_floor + c_gate_struct + c_slow + c_obstacle + c_all_gates
         
         # Debug: Print obstacle cost if significant
         if torch.any(c_obstacle > 1.0):
@@ -471,7 +561,7 @@ class AttitudeMPPIController(Controller):
             rel_pos = drone_pos - self.current_gate_center
             dist_to_plane = np.dot(rel_pos, gate_normal)  # Signed distance along normal (negative = before the plane)
             
-            if not self.goal_shifted and -0.05 < dist_to_plane < 0:  # Within 5cm before gate, and not yet shifted
+            if not self.goal_shifted and -0.1 < dist_to_plane < 0:  # Within 5cm before gate, and not yet shifted
                 self.goal_shifted = True  # Mark that we've shifted for this gate
                 self.prev_goal = self.goal.copy()
                 # Get forward direction from gate rotation
@@ -479,7 +569,7 @@ class AttitudeMPPIController(Controller):
                 rot = R.from_quat(gate_quat)
                 forward = rot.as_matrix()[:, 0]
                 # Move goal 8cm forward
-                self.goal = self.goal + 0.08 * forward
+                self.goal = self.goal + 0.1 * forward
                 print(f"\n[AttitudeMPPI] Case 3: Drone within 5cm before gate (dist={dist_to_plane:.3f}m), "
                       f"shifting goal forward to: {self.goal}")
                 
