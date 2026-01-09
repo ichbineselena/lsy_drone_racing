@@ -55,9 +55,13 @@ class AttitudeMPPIController(Controller):
         self.num_samples = 6000  # Stable optimization quality
         self.lambda_weight = 9.5  # Temperature parameter tuned for improved transitions
         
-        # Gate geometry constants
-        self.gate_opening = 0.40 #0.345 #0.375 #0.405  # 40.5cm square opening
-        self.gate_frame_thickness = 0.17 #0.05 #0.2 #0.185 #0.17  # 17cm frame
+        # Gate geometry constants (from physical measurement)
+        # Total gate edge: 74cm, Opening: 40.5cm, Frame width: 17cm each side, Thickness: 2cm
+        self.gate_opening = 0.405 #0.345 #0.405  # Opening width/height = 40.5cm
+        self.gate_frame_width = 0.17 #0.2 #0.17  # Frame bar width = 17cm (on each side)
+        self.gate_frame_thickness = 0.02  # Frame bar thickness/depth = 2cm
+        # Frame bar centers at opening_half + frame_width/2 = 0.2025 + 0.085 = 0.2875m
+        self.gate_frame_center_offset = 0.2875  # Frame bars centered at ±28.75cm from gate center
         
         # Obstacle geometry constants (from MuJoCo model)
         self.obstacle_radius = 0.015  # 1.5cm radius
@@ -187,7 +191,8 @@ class AttitudeMPPIController(Controller):
         print(f"  - Samples: {self.num_samples}")
         print(f"  - Lambda: {self.lambda_weight}")
         print(f"  - RPY limits: ±{np.rad2deg(self.rpy_max):.1f}°")
-        print(f"  - Gate opening: {self.gate_opening*100:.0f}cm square (frame: {self.gate_frame_thickness*100:.1f}cm)")
+        print(f"  - Gate: {self.gate_opening*100:.1f}cm opening, {self.gate_frame_width*100:.0f}cm frame width, {self.gate_frame_thickness*100:.0f}cm thickness")
+        print(f"  - Frame centers at ±{self.gate_frame_center_offset*100:.1f}cm from gate center")
         print(f"  - Obstacles: {len(self.obstacles_pos)} obstacles with {self.obstacle_safety_margin*100:.1f}cm safety margin")
 
     def compute_obstacle_cost(
@@ -296,15 +301,18 @@ class AttitudeMPPIController(Controller):
         # Initialize total gate avoidance cost
         total_gate_cost = torch.zeros(pos.shape[:-1], dtype=self.dtype, device=self.device)
         
-        # Gate geometry
-        opening_half = self.gate_opening / 2.0
-        frame_t = self.gate_frame_thickness
-        edge_offset = opening_half + frame_t
-        safety_r = 0.05  # 5cm safety margin for all gates
+        # Gate geometry (physical: 40.5cm opening, 17cm frame width, 2cm thickness)
+        frame_center_offset = self.gate_frame_center_offset  # 0.2875m - where frame bar centers are
+        frame_radius = self.gate_frame_width / 2.0  # 0.085m - half-width of frame bars (capsule radius)
+        safety_r = 0.05  # 5cm safety margin beyond frame surface
+        effective_avoid_dist = frame_radius + safety_r  # ~0.135m total distance to avoid from frame center
         
-        # Weights for gate frame avoidance (slightly lower than target gate to prioritize target)
-        w_vert_all = 150.0  # Vertical frame weight
-        w_horiz_all = 120.0  # Horizontal frame weight
+        # Opening limits for horizontal frame collision check
+        opening_half = self.gate_opening / 2.0  # 0.2025m
+        
+        # Weights for gate frame avoidance (strong to prevent collision with passed gates)
+        w_vert_all = 500.0  # Vertical frame weight
+        w_horiz_all = 450.0  # Horizontal frame weight
         
         # Get live gate poses if available
         if obs is not None and "gates_pos" in obs and "gates_quat" in obs:
@@ -333,22 +341,23 @@ class AttitudeMPPIController(Controller):
             # Only apply avoidance when drone is near the gate plane (within 0.8m)
             near_gate = torch.abs(x_n) < 0.8
             
-            # Vertical frames: poles at y = ±edge_offset
-            dy_left = torch.abs(y_p + edge_offset)
-            dy_right = torch.abs(y_p - edge_offset)
+            # Vertical frames: poles centered at y = ±frame_center_offset (±0.35m)
+            dy_left = torch.abs(y_p + frame_center_offset)
+            dy_right = torch.abs(y_p - frame_center_offset)
             
-            # Penalty when closer than safety_r to vertical frames
-            c_vert_left = torch.clamp(safety_r - dy_left, min=0.0) ** 2
-            c_vert_right = torch.clamp(safety_r - dy_right, min=0.0) ** 2
+            # Penalty when closer than effective_avoid_dist to vertical frame centers
+            c_vert_left = torch.clamp(effective_avoid_dist - dy_left, min=0.0) ** 2
+            c_vert_right = torch.clamp(effective_avoid_dist - dy_right, min=0.0) ** 2
             c_vert = w_vert_all * (c_vert_left + c_vert_right)
             
-            # Horizontal frames: capsules at z = ±edge_offset (within lateral span)
-            dz_top = torch.abs(z_p - edge_offset)
-            dz_bottom = torch.abs(z_p + edge_offset)
-            within_span = torch.abs(y_p) <= (opening_half + frame_t + 0.1)  # Slightly wider check
+            # Horizontal frames: bars centered at z = ±frame_center_offset (±0.35m)
+            dz_top = torch.abs(z_p - frame_center_offset)
+            dz_bottom = torch.abs(z_p + frame_center_offset)
+            # Only apply when within lateral span (where horizontal bars exist)
+            within_span = torch.abs(y_p) <= (frame_center_offset + 0.05)
             
-            c_horiz_top = torch.clamp(safety_r - dz_top, min=0.0) ** 2
-            c_horiz_bottom = torch.clamp(safety_r - dz_bottom, min=0.0) ** 2
+            c_horiz_top = torch.clamp(effective_avoid_dist - dz_top, min=0.0) ** 2
+            c_horiz_bottom = torch.clamp(effective_avoid_dist - dz_bottom, min=0.0) ** 2
             c_horiz = torch.where(
                 within_span,
                 w_horiz_all * (c_horiz_top + c_horiz_bottom),
@@ -403,38 +412,39 @@ class AttitudeMPPIController(Controller):
         y_p = torch.sum(rel * gate_R[:, 1], dim=-1)
         z_p = torch.sum(rel * gate_R[:, 2], dim=-1)
 
-        # Opening and frame geometry
-        opening_half = self.gate_opening / 2.0  # 0.15 m
-        frame_t = self.gate_frame_thickness      # 0.045 m
-        edge_offset = opening_half + frame_t #* 0.5
-        safety_r = 0.0 #0.1  # keep ~10cm away from frames
+        # Opening and frame geometry (physical measurement)
+        # 40.5cm opening, 17cm frame width, 2cm thickness
+        opening_half = self.gate_opening / 2.0  # 0.2025m inner opening edge
+        frame_center_offset = self.gate_frame_center_offset  # 0.2875m frame bar center position
+        frame_radius = self.gate_frame_width / 2.0  # 0.085m frame bar half-width (capsule radius)
+        safety_r = 0.05  # 5cm safety margin beyond frame surface
+        effective_avoid_dist = frame_radius + safety_r  # ~0.135m total avoid distance from frame center
 
         # Attraction: encourage being inside opening box in gate plane
         # Hinge loss if outside opening in y or z
         y_excess = torch.clamp(torch.abs(y_p) - opening_half, min=0.0)
         z_excess = torch.clamp(torch.abs(z_p) - opening_half, min=0.0)
-        w_open = 12.0
+        w_open = 40.0  # Strong opening attraction
         c_open_hinge = w_open * (y_excess ** 2 + z_excess ** 2)
 
         # Soft attraction toward the 2D opening center (y=0, z=0) when near the gate plane
-        near_plane = torch.abs(x_n) < 0.6
-        w_center = 4.5
+        near_plane = torch.abs(x_n) < 0.8
+        w_center = 15.0  # Strong centering for small opening
         c_center = torch.where(near_plane, w_center * (y_p ** 2 + z_p ** 2), torch.zeros_like(x_n))
 
-        # Obstacle avoidance: vertical frames modeled as infinite poles at y=±edge_offset
-        # Penalize inverse-square proximity inside safety radius
-        dy_left = torch.abs(y_p + edge_offset)
-        dy_right = torch.abs(y_p - edge_offset)
-        w_vert = 240.0 #120.0
-        c_vert = w_vert * (torch.clamp(safety_r - dy_left, min=0.0) ** 2 + torch.clamp(safety_r - dy_right, min=0.0) ** 2)
+        # Obstacle avoidance: vertical frames at y=±frame_center_offset (±0.2875m)
+        dy_left = torch.abs(y_p + frame_center_offset)
+        dy_right = torch.abs(y_p - frame_center_offset)
+        w_vert = 600.0  # Strong vertical frame avoidance
+        c_vert = w_vert * (torch.clamp(effective_avoid_dist - dy_left, min=0.0) ** 2 + torch.clamp(effective_avoid_dist - dy_right, min=0.0) ** 2)
 
-        # Obstacle avoidance: horizontal frames modeled as capsules along y at z=±edge_offset
-        dz_top = torch.abs(z_p - edge_offset)
-        dz_bottom = torch.abs(z_p + edge_offset)
-        # Active only when within lateral span around the gate opening (|y| <= opening_half + frame_t)
-        within_span = torch.abs(y_p) <= (opening_half + frame_t)
-        w_horiz = 200.0 #100.0
-        c_horiz = torch.where(within_span, w_horiz * (torch.clamp(safety_r - dz_top, min=0.0) ** 2 + torch.clamp(safety_r - dz_bottom, min=0.0) ** 2), torch.zeros_like(dz_top))
+        # Obstacle avoidance: horizontal frames at z=±frame_center_offset (±0.2875m)
+        dz_top = torch.abs(z_p - frame_center_offset)
+        dz_bottom = torch.abs(z_p + frame_center_offset)
+        # Active only when within lateral span where horizontal bars exist
+        within_span = torch.abs(y_p) <= (frame_center_offset + frame_radius + 0.05)
+        w_horiz = 550.0  # Strong horizontal frame avoidance
+        c_horiz = torch.where(within_span, w_horiz * (torch.clamp(effective_avoid_dist - dz_top, min=0.0) ** 2 + torch.clamp(effective_avoid_dist - dz_bottom, min=0.0) ** 2), torch.zeros_like(dz_top))
 
         c_gate_struct = c_open_hinge + c_center + c_vert + c_horiz
 
@@ -446,8 +456,8 @@ class AttitudeMPPIController(Controller):
             torch.minimum(dy_left, dy_right),
             torch.minimum(dz_top, dz_bottom)
         )
-        high_risk = min_frame_dist < (safety_r + 0.01)
-        w_slow = 0.4
+        high_risk = min_frame_dist < effective_avoid_dist
+        w_slow = 0.5
         c_slow = torch.where(high_risk, w_slow * torch.sum(vel ** 2, dim=-1), torch.zeros_like(min_frame_dist))
 
         # 3. Attitude - prefer level flight

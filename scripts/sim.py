@@ -129,12 +129,20 @@ def simulate(
                     
                     # 3. Draw ALL gate frames modeling (not just current target)
                     if hasattr(controller, 'gates_pos') and hasattr(controller, 'gates_quat'):
-                        if hasattr(controller, 'gate_opening') and hasattr(controller, 'gate_frame_thickness'):
-                            half_opening = controller.gate_opening / 2.0
+                        if hasattr(controller, 'gate_opening'):
+                            half_opening = controller.gate_opening / 2.0  # 0.2025m
+                            # Use gate_frame_center_offset if available (0.2875m)
+                            if hasattr(controller, 'gate_frame_center_offset'):
+                                frame_center_offset = controller.gate_frame_center_offset  # 0.2875m
+                            else:
+                                frame_center_offset = 0.2875  # Default
+                            # Use gate_frame_width for capsule radius (17cm / 2 = 8.5cm)
+                            if hasattr(controller, 'gate_frame_width'):
+                                frame_radius = controller.gate_frame_width / 2.0  # 0.085m
+                            else:
+                                frame_radius = 0.085  # Default
                             frame_safety_margin = 0.05  # 5cm safety margin matching controller
-                            frame_radius = controller.gate_frame_thickness / 2.0
                             frame_radius_with_margin = frame_radius + frame_safety_margin
-                            total_half = half_opening + controller.gate_frame_thickness / 2.0
                             
                             # Get live gate poses if available
                             if "gates_pos" in obs and "gates_quat" in obs:
@@ -173,11 +181,11 @@ def simulate(
                                         color=(0.0, 1.0, 0.0, 0.3)  # Green for opening
                                     )
                                 
-                                # Left vertical frame (pole)
-                                left_center_local = np.array([0, -total_half, 0])
+                                # Left vertical frame (pole) - at y = -0.35m in gate frame
+                                left_center_local = np.array([0, -frame_center_offset, 0])
                                 left_center_world = gate_center + R_matrix @ left_center_local
-                                left_top = left_center_world + R_matrix @ np.array([0, 0, half_opening])
-                                left_bottom = left_center_world - R_matrix @ np.array([0, 0, half_opening])
+                                left_top = left_center_world + R_matrix @ np.array([0, 0, frame_center_offset])
+                                left_bottom = left_center_world - R_matrix @ np.array([0, 0, frame_center_offset])
                                 
                                 draw_capsule(
                                     env,
@@ -185,7 +193,7 @@ def simulate(
                                     end=left_bottom,
                                     radius=frame_radius_with_margin,
                                     color=vert_color,
-                                    segments=4
+                                    segments=8#4
                                 )
                                 draw_line(
                                     env,
@@ -195,11 +203,11 @@ def simulate(
                                     max_size=2.0
                                 )
                                 
-                                # Right vertical frame (pole)
-                                right_center_local = np.array([0, total_half, 0])
+                                # Right vertical frame (pole) - at y = +0.35m in gate frame
+                                right_center_local = np.array([0, frame_center_offset, 0])
                                 right_center_world = gate_center + R_matrix @ right_center_local
-                                right_top = right_center_world + R_matrix @ np.array([0, 0, half_opening])
-                                right_bottom = right_center_world - R_matrix @ np.array([0, 0, half_opening])
+                                right_top = right_center_world + R_matrix @ np.array([0, 0, frame_center_offset])
+                                right_bottom = right_center_world - R_matrix @ np.array([0, 0, frame_center_offset])
                                 
                                 draw_capsule(
                                     env,
@@ -207,7 +215,7 @@ def simulate(
                                     end=right_bottom,
                                     radius=frame_radius_with_margin,
                                     color=vert_color,
-                                    segments=4
+                                    segments=8#4
                                 )
                                 draw_line(
                                     env,
@@ -217,11 +225,11 @@ def simulate(
                                     max_size=2.0
                                 )
                                 
-                                # Top horizontal frame (capsule)
-                                top_center_local = np.array([0, 0, total_half])
+                                # Top horizontal frame (capsule) - at z = +0.35m in gate frame
+                                top_center_local = np.array([0, 0, frame_center_offset])
                                 top_center_world = gate_center + R_matrix @ top_center_local
-                                top_left = top_center_world - R_matrix @ np.array([0, half_opening, 0])
-                                top_right = top_center_world + R_matrix @ np.array([0, half_opening, 0])
+                                top_left = top_center_world - R_matrix @ np.array([0, frame_center_offset, 0])
+                                top_right = top_center_world + R_matrix @ np.array([0, frame_center_offset, 0])
                                 
                                 draw_capsule(
                                     env,
@@ -229,14 +237,14 @@ def simulate(
                                     end=top_right,
                                     radius=frame_radius_with_margin,
                                     color=horiz_color,
-                                    segments=4
+                                    segments=8#4
                                 )
                                 
-                                # Bottom horizontal frame (capsule)
-                                bottom_center_local = np.array([0, 0, -total_half])
+                                # Bottom horizontal frame (capsule) - at z = -0.35m in gate frame
+                                bottom_center_local = np.array([0, 0, -frame_center_offset])
                                 bottom_center_world = gate_center + R_matrix @ bottom_center_local
-                                bottom_left = bottom_center_world - R_matrix @ np.array([0, half_opening, 0])
-                                bottom_right = bottom_center_world + R_matrix @ np.array([0, half_opening, 0])
+                                bottom_left = bottom_center_world - R_matrix @ np.array([0, frame_center_offset, 0])
+                                bottom_right = bottom_center_world + R_matrix @ np.array([0, frame_center_offset, 0])
                                 
                                 draw_capsule(
                                     env,
@@ -244,7 +252,7 @@ def simulate(
                                     end=bottom_right,
                                     radius=frame_radius_with_margin,
                                     color=horiz_color,
-                                    segments=4
+                                    segments=8#4
                                 )
                                 
                                 # Draw gate normal vector (only for target)
