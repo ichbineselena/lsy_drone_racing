@@ -52,12 +52,12 @@ class AttitudeMPPIController(Controller):
         # MPPI hyperparameters - optimized for robust trajectory optimization
         self.mppi_horizon = 25  # Planning horizon steps (proven stable for 4-gate success)
         self.mppi_dt = self._dt * 2  # 0.04s time discretization
-        self.num_samples = 6000  # Stable optimization quality
+        self.num_samples = 3000  # Stable optimization quality
         self.lambda_weight = 9.5  # Temperature parameter tuned for improved transitions
         
         # Gate geometry constants (from physical measurement)
         # Total gate edge: 74cm, Opening: 40.5cm, Frame width: 17cm each side, Thickness: 2cm
-        self.gate_opening = 0.405 #0.345 #0.405  # Opening width/height = 40.5cm
+        self.gate_opening = 0.35 #0.345 #0.405  # Opening width/height = 40.5cm
         self.gate_frame_width = 0.17 #0.2 #0.17  # Frame bar width = 17cm (on each side)
         self.gate_frame_thickness = 0.02  # Frame bar thickness/depth = 2cm
         # Frame bar centers at opening_half + frame_width/2 = 0.2025 + 0.085 = 0.2875m
@@ -117,6 +117,10 @@ class AttitudeMPPIController(Controller):
         # Flag to track if goal has been shifted for current gate
         self.goal_shifted = False
         self.obstacles_pos = obs["obstacles_pos"].copy() if "obstacles_pos" in obs else np.array([])
+        
+        # Pause mechanism to safely pass through gate before switching targets
+        self.pause_counter = 0
+        self.pause_duration = 20  # ~0.8s at 25Hz to safely pass through gate opening
 
         # More conservative control limits
         self.rpy_max = 0.5 #0.3  # ±17 degrees (more conservative)
@@ -311,8 +315,8 @@ class AttitudeMPPIController(Controller):
         opening_half = self.gate_opening / 2.0  # 0.2025m
         
         # Weights for gate frame avoidance (strong to prevent collision with passed gates)
-        w_vert_all = 500.0  # Vertical frame weight
-        w_horiz_all = 450.0  # Horizontal frame weight
+        w_vert_all = 1000.0  # Vertical frame weight
+        w_horiz_all = 800.0  # Horizontal frame weight
         
         # Get live gate poses if available
         if obs is not None and "gates_pos" in obs and "gates_quat" in obs:
@@ -339,7 +343,7 @@ class AttitudeMPPIController(Controller):
             z_p = torch.sum(rel * gate_R[:, 2], dim=-1)  # Vertical direction
             
             # Only apply avoidance when drone is near the gate plane (within 0.8m)
-            near_gate = torch.abs(x_n) < 0.8
+            near_gate = torch.abs(x_n) < 1.5
             
             # Vertical frames: poles centered at y = ±frame_center_offset (±0.35m)
             dy_left = torch.abs(y_p + frame_center_offset)
@@ -517,12 +521,16 @@ class AttitudeMPPIController(Controller):
             # Fallback to previously cached values
             pass
 
+        # Decrement pause counter each step
+        if self.pause_counter > 0:
+            self.pause_counter -= 1
+        
         # Goal update logic with 3 cases
         new_target_idx = int(obs["target_gate"])
         drone_pos = np.array(obs["pos"], dtype=float)
         
-        # CASE 1: Target index changed
-        if new_target_idx != self.target_gate_idx:
+        # CASE 1: Target index changed (deferred if pause is active)
+        if new_target_idx != self.target_gate_idx and self.pause_counter == 0:
             self.old_gate_pos = self.gates_pos[self.target_gate_idx]
             self.target_gate_idx = new_target_idx
             self.prev_goal = self.goal.copy()
@@ -541,6 +549,10 @@ class AttitudeMPPIController(Controller):
                 self.current_gate_quat = np.array(obs["gates_quat"][self.target_gate_idx], dtype=float)
             except Exception:
                 pass
+        elif self.pause_counter > 0 and new_target_idx != self.target_gate_idx:
+            # During pause, maintain current goal and don't switch targets yet
+            if self.step_count % 10 == 0:
+                print(f"[AttitudeMPPI] Pause active ({self.pause_counter} steps remaining) - deferring gate {self.target_gate_idx} -> {new_target_idx}")
         else:
             # CASE 2: Same index, but gate position given more precisely
             new_gate_pos = np.array(obs["gates_pos"][self.target_gate_idx], dtype=float)
@@ -571,27 +583,19 @@ class AttitudeMPPIController(Controller):
             rel_pos = drone_pos - self.current_gate_center
             dist_to_plane = np.dot(rel_pos, gate_normal)  # Signed distance along normal (negative = before the plane)
             
-            if not self.goal_shifted and -0.1 < dist_to_plane < 0:  # Within 5cm before gate, and not yet shifted
+            if not self.goal_shifted and -0.15 < dist_to_plane < 0:  # Within 5cm before gate, and not yet shifted
                 self.goal_shifted = True  # Mark that we've shifted for this gate
                 self.prev_goal = self.goal.copy()
-                
-                # Get forward direction based on drone's flying direction (velocity)
-                drone_vel = np.array(obs["vel"], dtype=float)
-                vel_magnitude = np.linalg.norm(drone_vel)
-                
-                if vel_magnitude > 0.1:  # Use drone velocity if moving with reasonable speed
-                    forward = drone_vel / vel_magnitude
-                else:
-                    # Fallback to gate direction if drone is moving slowly
-                    gate_quat = np.array(obs["gates_quat"][self.target_gate_idx], dtype=float)
-                    rot = R.from_quat(gate_quat)
-                    forward = rot.as_matrix()[:, 0]
-                
-                # Move goal 8cm forward in the direction the drone is flying
-                self.goal = self.goal + 0.08 * forward
+                # Get forward direction from gate rotation
+                gate_quat = np.array(obs["gates_quat"][self.target_gate_idx], dtype=float)
+                rot = R.from_quat(gate_quat)
+                forward = rot.as_matrix()[:, 0]
+                # Move goal 8cm forward
+                self.goal = self.goal + 0.2 * forward
+                # Activate pause to maintain shifted goal and avoid immediate gate switching
+                self.pause_counter = self.pause_duration
                 print(f"\n[AttitudeMPPI] Case 3: Drone within 5cm before gate (dist={dist_to_plane:.3f}m), "
-                      f"velocity={vel_magnitude:.2f}m/s, "
-                      f"shifting goal forward to: {self.goal}")
+                      f"shifting goal forward and activating {self.pause_duration}-step pause to: {self.goal}")
                 
                 # Reset control sequence on goal progression
                 initial_control = torch.zeros((self.mppi_horizon, 4), dtype=self.dtype, device=self.device)
@@ -672,6 +676,7 @@ class AttitudeMPPIController(Controller):
         self.step_count = 0
         self.prev_control = None
         self.obstacles_pos = np.array([])
+        self.pause_counter = 0
         
         print("[AttitudeMPPI] Episode reset")
 
