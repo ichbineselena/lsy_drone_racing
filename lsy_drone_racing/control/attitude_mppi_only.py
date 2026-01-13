@@ -52,7 +52,7 @@ class AttitudeMPPIController(Controller):
         # MPPI hyperparameters - optimized for robust trajectory optimization
         self.mppi_horizon = 25  # Planning horizon steps (proven stable for 4-gate success)
         self.mppi_dt = self._dt * 2  # 0.04s time discretization
-        self.num_samples = 3000  # Stable optimization quality
+        self.num_samples = 1000  # Stable optimization quality
         self.lambda_weight = 9.5  # Temperature parameter tuned for improved transitions
         
         # Gate geometry constants (from physical measurement)
@@ -120,7 +120,7 @@ class AttitudeMPPIController(Controller):
         
         # Pause mechanism to safely pass through gate before switching targets
         self.pause_counter = 0
-        self.pause_duration = 20  # ~0.8s at 25Hz to safely pass through gate opening
+        self.pause_duration = 10  # ~0.6s at 25Hz to safely pass through gate opening
 
         # More conservative control limits
         self.rpy_max = 0.5 #0.3  # ±17 degrees (more conservative)
@@ -583,7 +583,7 @@ class AttitudeMPPIController(Controller):
             rel_pos = drone_pos - self.current_gate_center
             dist_to_plane = np.dot(rel_pos, gate_normal)  # Signed distance along normal (negative = before the plane)
             
-            if not self.goal_shifted and -0.15 < dist_to_plane < 0:  # Within 5cm before gate, and not yet shifted
+            if not self.goal_shifted and -0.1 < dist_to_plane < 0:  # Within 5cm before gate, and not yet shifted
                 self.goal_shifted = True  # Mark that we've shifted for this gate
                 self.prev_goal = self.goal.copy()
                 # Get forward direction from gate rotation
@@ -591,7 +591,7 @@ class AttitudeMPPIController(Controller):
                 rot = R.from_quat(gate_quat)
                 forward = rot.as_matrix()[:, 0]
                 # Move goal 8cm forward
-                self.goal = self.goal + 0.2 * forward
+                self.goal = self.goal + 0.15 * forward
                 # Activate pause to maintain shifted goal and avoid immediate gate switching
                 self.pause_counter = self.pause_duration
                 print(f"\n[AttitudeMPPI] Case 3: Drone within 5cm before gate (dist={dist_to_plane:.3f}m), "
