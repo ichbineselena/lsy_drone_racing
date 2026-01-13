@@ -52,7 +52,7 @@ class AttitudeMPPIController(Controller):
         # MPPI hyperparameters - optimized for robust trajectory optimization
         self.mppi_horizon = 25  # Planning horizon steps (proven stable for 4-gate success)
         self.mppi_dt = self._dt * 2  # 0.04s time discretization
-        self.num_samples = 1000  # Stable optimization quality
+        self.num_samples = 6000  # Stable optimization quality
         self.lambda_weight = 9.5  # Temperature parameter tuned for improved transitions
         
         # Gate geometry constants (from physical measurement)
@@ -342,8 +342,8 @@ class AttitudeMPPIController(Controller):
             y_p = torch.sum(rel * gate_R[:, 1], dim=-1)  # Lateral direction
             z_p = torch.sum(rel * gate_R[:, 2], dim=-1)  # Vertical direction
             
-            # Only apply avoidance when drone is near the gate plane (within 0.8m)
-            near_gate = torch.abs(x_n) < 1.5
+            # EXPERIMENT: Always apply avoidance to all gates regardless of distance
+            near_gate = torch.ones_like(x_n, dtype=torch.bool)
             
             # Vertical frames: poles centered at y = ±frame_center_offset (±0.35m)
             dy_left = torch.abs(y_p + frame_center_offset)
