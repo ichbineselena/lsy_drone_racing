@@ -111,7 +111,7 @@ class AttitudeMPPIController(Controller):
         # Gate traversal configuration - RELAXED for less hesitation
         self.traversal_config = {
             "approach_distance": 0.35,       # Reduced from 0.45
-            "exit_distance": 0.30,           # Reduced from 0.40
+            "exit_distance": 0.45,           # Increased from 0.30 - more clearance before turning
             "align_threshold": 0.12,         # Reduced from 0.20
             "traverse_threshold": 0.03,      # Reduced from 0.05
             "exit_threshold": 0.20,          # Reduced from 0.30
@@ -138,6 +138,10 @@ class AttitudeMPPIController(Controller):
         # Pause mechanism
         self.pause_counter = 0
         self.pause_duration = 10
+
+        # Recently passed gate tracking for enhanced avoidance
+        self.recently_passed_gate = -1
+        self.recently_passed_decay = 0  # Steps since passing
 
         # Control limits
         self.rpy_max = 0.5
@@ -174,9 +178,13 @@ class AttitudeMPPIController(Controller):
             "corridor":  50.0,                 # Significantly reduced from 200.0
             "risk_slowdown": 0.3,             # Reduced from 0.5
 
-            # All gates avoidance - REDUCED
-            "all_gates_vertical": 600.0,      # Reduced from 1000.0
-            "all_gates_horizontal": 500.0,    # Reduced from 800.0
+            # All gates avoidance - INCREASED for safety after passing
+            "all_gates_vertical": 900.0,      # Increased from 600.0
+            "all_gates_horizontal": 750.0,    # Increased from 500.0
+            
+            # Recently passed gate gets extra avoidance
+            "recently_passed_multiplier": 2.5,  # Extra weight for just-passed gates
+            "recently_passed_decay_steps": 50,  # Steps to decay the extra weight
         }
 
         # Store previous control
@@ -577,7 +585,7 @@ class AttitudeMPPIController(Controller):
 
         frame_center_offset = self.gate_frame_center_offset
         frame_radius = self.gate_frame_width / 2.0
-        safety_r = 0.05
+        safety_r = 0.07  # Increased from 0.05 for more margin
         effective_avoid_dist = frame_radius + safety_r
 
         if obs is not None and "gates_pos" in obs and "gates_quat" in obs:
@@ -591,6 +599,13 @@ class AttitudeMPPIController(Controller):
             # Skip current target gate (handled by compute_gate_structure_cost)
             if gate_idx == self.target_gate_idx:
                 continue
+            
+            # Compute weight multiplier for recently passed gates
+            weight_multiplier = 1.0
+            if gate_idx == self.recently_passed_gate and self.recently_passed_decay > 0:
+                decay_steps = self.cost_weights["recently_passed_decay_steps"]
+                decay_factor = self.recently_passed_decay / decay_steps
+                weight_multiplier = 1.0 + (self.cost_weights["recently_passed_multiplier"] - 1.0) * decay_factor
                 
             gate_center_np = np.array(gates_pos_live[gate_idx], dtype=float)
             gate_quat_np = np.array(gates_quat_live[gate_idx], dtype=float)
@@ -604,13 +619,14 @@ class AttitudeMPPIController(Controller):
             y_p = torch.sum(rel * gate_R[: , 1], dim=-1)
             z_p = torch.sum(rel * gate_R[: , 2], dim=-1)
 
-            # Only apply cost when close to this gate's plane
-            near_this_gate = torch.abs(x_n) < 0.4
+            # Increased activation distance for recently passed gates
+            activation_dist = 0.7 if gate_idx == self.recently_passed_gate else 0.5
+            near_this_gate = torch.abs(x_n) < activation_dist
 
             # Vertical frames
             dy_left = torch.abs(y_p + frame_center_offset)
             dy_right = torch.abs(y_p - frame_center_offset)
-            c_vert = self.cost_weights["all_gates_vertical"] * (
+            c_vert = weight_multiplier * self.cost_weights["all_gates_vertical"] * (
                 torch.clamp(effective_avoid_dist - dy_left, min=0.0) ** 2 +
                 torch.clamp(effective_avoid_dist - dy_right, min=0.0) ** 2
             )
@@ -618,10 +634,10 @@ class AttitudeMPPIController(Controller):
             # Horizontal frames
             dz_top = torch.abs(z_p - frame_center_offset)
             dz_bottom = torch.abs(z_p + frame_center_offset)
-            within_span = torch.abs(y_p) <= (frame_center_offset + 0.05)
+            within_span = torch.abs(y_p) <= (frame_center_offset + 0.08)  # Increased from 0.05
             c_horiz = torch.where(
                 within_span,
-                self.cost_weights["all_gates_horizontal"] * (
+                weight_multiplier * self.cost_weights["all_gates_horizontal"] * (
                     torch.clamp(effective_avoid_dist - dz_top, min=0.0) ** 2 +
                     torch.clamp(effective_avoid_dist - dz_bottom, min=0.0) ** 2
                 ),
@@ -770,6 +786,10 @@ class AttitudeMPPIController(Controller):
         if self.pause_counter > 0:
             self.pause_counter -= 1
 
+        # Decay recently passed gate tracking
+        if self.recently_passed_decay > 0:
+            self.recently_passed_decay -= 1
+
         # Handle target gate changes
         new_target_idx = int(obs["target_gate"])
         if new_target_idx != self.target_gate_idx and self.pause_counter == 0:
@@ -827,6 +847,11 @@ class AttitudeMPPIController(Controller):
     def _handle_gate_change(self, obs: dict, new_target_idx: int):
         """Handle transition to new target gate."""
         print(f"\n[AttitudeMPPI] Target gate changed:  {self.target_gate_idx} -> {new_target_idx}")
+
+        # Track recently passed gate for enhanced avoidance
+        self.recently_passed_gate = self.target_gate_idx
+        self.recently_passed_decay = int(self.cost_weights["recently_passed_decay_steps"])
+        print(f"[AttitudeMPPI] Marking gate {self.recently_passed_gate} as recently passed")
 
         self.target_gate_idx = new_target_idx
         self.gate_phase = GatePhase.APPROACH
@@ -907,6 +932,8 @@ class AttitudeMPPIController(Controller):
         self.pause_counter = 0
         self.gate_phase = GatePhase.APPROACH
         self.waypoint_index = 0
+        self.recently_passed_gate = -1
+        self.recently_passed_decay = 0
 
         print("[AttitudeMPPI] Episode reset")
 

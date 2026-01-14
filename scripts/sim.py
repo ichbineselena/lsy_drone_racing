@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 def simulate(
-    config: str = "level2.toml",
+    config: str = "level2_new.toml",
     controller: str | None = None,
     n_runs: int = 1,
     render: bool | None = None,
