@@ -57,8 +57,8 @@ class AttitudeMPPIController(Controller):
         
         # Gate geometry constants (from physical measurement)
         # Total gate edge: 74cm, Opening: 40.5cm, Frame width: 17cm each side, Thickness: 2cm
-        self.gate_opening = 0.35 #0.345 #0.405  # Opening width/height = 40.5cm
-        self.gate_frame_width = 0.17 #0.2 #0.17  # Frame bar width = 17cm (on each side)
+        self.gate_opening = 0.405  # Opening width/height = 40.5cm (PHYSICAL SIZE - don't shrink!)
+        self.gate_frame_width = 0.17  # Frame bar width = 17cm (on each side)
         self.gate_frame_thickness = 0.02  # Frame bar thickness/depth = 2cm
         # Frame bar centers at opening_half + frame_width/2 = 0.2025 + 0.085 = 0.2875m
         self.gate_frame_center_offset = 0.2875  # Frame bars centered at ±28.75cm from gate center
@@ -292,8 +292,8 @@ class AttitudeMPPIController(Controller):
     ) -> torch.Tensor:
         """Compute gate frame avoidance cost for ALL gates (not just current target).
         
-        This prevents the drone from colliding with gates it has already passed
-        or gates it will pass in the future.
+        This treats each frame component (4 per gate) as a capsule obstacle, using
+        the exact same avoidance logic as obstacle poles.
         
         Args:
             pos: Position tensor of shape (..., 3)
@@ -308,15 +308,14 @@ class AttitudeMPPIController(Controller):
         # Gate geometry (physical: 40.5cm opening, 17cm frame width, 2cm thickness)
         frame_center_offset = self.gate_frame_center_offset  # 0.2875m - where frame bar centers are
         frame_radius = self.gate_frame_width / 2.0  # 0.085m - half-width of frame bars (capsule radius)
-        safety_r = 0.05  # 5cm safety margin beyond frame surface
-        effective_avoid_dist = frame_radius + safety_r  # ~0.135m total distance to avoid from frame center
+        safety_margin = 0.05  # 5cm safety margin beyond frame surface
+        effective_radius = frame_radius + safety_margin  # ~0.135m total distance to avoid from frame center
         
-        # Opening limits for horizontal frame collision check
-        opening_half = self.gate_opening / 2.0  # 0.2025m
+        # Gate frame half-length (vertical extent of gate)
+        gate_half_height = 0.37  # ~37cm vertical extent (half of gate structure)
         
-        # Weights for gate frame avoidance (strong to prevent collision with passed gates)
-        w_vert_all = 1000.0  # Vertical frame weight
-        w_horiz_all = 800.0  # Horizontal frame weight
+        # Weight for gate frame avoidance (same as obstacle avoidance logic)
+        weight = 50.0  # Same as obstacle weight for consistency
         
         # Get live gate poses if available
         if obs is not None and "gates_pos" in obs and "gates_quat" in obs:
@@ -326,8 +325,12 @@ class AttitudeMPPIController(Controller):
             gates_pos_live = self.gates_pos
             gates_quat_live = self.gates_quat
         
-        # Iterate over all gates
+        # Iterate over all gates except current target
         for gate_idx in range(len(self.gates_pos)):
+            # Skip current target gate
+            if gate_idx == self.target_gate_idx:
+                continue
+            
             # Get gate pose
             gate_center_np = np.array(gates_pos_live[gate_idx], dtype=float)
             gate_quat_np = np.array(gates_quat_live[gate_idx], dtype=float)
@@ -336,43 +339,115 @@ class AttitudeMPPIController(Controller):
             gate_R = torch.tensor(gate_R_np, dtype=self.dtype, device=self.device)
             gate_center = torch.tensor(gate_center_np, dtype=self.dtype, device=self.device)
             
-            # Transform position into gate-local coordinates
-            rel = pos - gate_center
-            x_n = torch.sum(rel * gate_R[:, 0], dim=-1)  # Normal direction
-            y_p = torch.sum(rel * gate_R[:, 1], dim=-1)  # Lateral direction
-            z_p = torch.sum(rel * gate_R[:, 2], dim=-1)  # Vertical direction
+            # Gate frame has 4 capsule components:
+            # 1. Left vertical pole (at y = -frame_center_offset, oriented along z)
+            # 2. Right vertical pole (at y = +frame_center_offset, oriented along z)
+            # 3. Top horizontal bar (at z = +frame_center_offset, oriented along y)
+            # 4. Bottom horizontal bar (at z = -frame_center_offset, oriented along y)
             
-            # EXPERIMENT: Always apply avoidance to all gates regardless of distance
-            near_gate = torch.ones_like(x_n, dtype=torch.bool)
-            
-            # Vertical frames: poles centered at y = ±frame_center_offset (±0.35m)
-            dy_left = torch.abs(y_p + frame_center_offset)
-            dy_right = torch.abs(y_p - frame_center_offset)
-            
-            # Penalty when closer than effective_avoid_dist to vertical frame centers
-            c_vert_left = torch.clamp(effective_avoid_dist - dy_left, min=0.0) ** 2
-            c_vert_right = torch.clamp(effective_avoid_dist - dy_right, min=0.0) ** 2
-            c_vert = w_vert_all * (c_vert_left + c_vert_right)
-            
-            # Horizontal frames: bars centered at z = ±frame_center_offset (±0.35m)
-            dz_top = torch.abs(z_p - frame_center_offset)
-            dz_bottom = torch.abs(z_p + frame_center_offset)
-            # Only apply when within lateral span (where horizontal bars exist)
-            within_span = torch.abs(y_p) <= (frame_center_offset + 0.05)
-            
-            c_horiz_top = torch.clamp(effective_avoid_dist - dz_top, min=0.0) ** 2
-            c_horiz_bottom = torch.clamp(effective_avoid_dist - dz_bottom, min=0.0) ** 2
-            c_horiz = torch.where(
-                within_span,
-                w_horiz_all * (c_horiz_top + c_horiz_bottom),
-                torch.zeros_like(dz_top)
+            # --- LEFT VERTICAL POLE (capsule along z-axis) ---
+            # Center of left pole in world coordinates
+            left_pole_center_local = torch.tensor(
+                [0.0, -frame_center_offset, 0.0], 
+                dtype=self.dtype, device=self.device
             )
+            left_pole_center = gate_center + torch.matmul(gate_R, left_pole_center_local)
             
-            # Apply cost only when near the gate plane
-            gate_cost = torch.where(near_gate, c_vert + c_horiz, torch.zeros_like(c_vert))
+            # Vector from pole center to drone position
+            rel_vec = pos - left_pole_center
             
-            # Add to total
-            total_gate_cost = total_gate_cost + gate_cost
+            # Project onto vertical axis (z-axis in gate frame)
+            z_gate_axis = gate_R[:, 2]  # Z-axis of gate
+            z_proj = torch.sum(rel_vec * z_gate_axis, dim=-1)
+            z_clamped = torch.clamp(z_proj, -gate_half_height, gate_half_height)
+            
+            # Closest point on the capsule segment
+            closest_point = left_pole_center + z_clamped.unsqueeze(-1) * z_gate_axis.unsqueeze(0)
+            
+            # Distance from closest point to drone
+            dist = torch.norm(pos - closest_point, dim=-1)
+            surface_dist = dist - effective_radius
+            
+            # Apply penalty (same as obstacle avoidance)
+            penalty_threshold = effective_radius * 2.0
+            mask = surface_dist < penalty_threshold
+            
+            if torch.any(mask):
+                penalty = torch.exp(-surface_dist[mask] / (effective_radius * 0.5))
+                inv_dist_sq = 1.0 / (surface_dist[mask] ** 2 + 0.01)
+                cost = weight * penalty * inv_dist_sq
+                total_gate_cost = total_gate_cost.clone()
+                total_gate_cost[mask] = total_gate_cost[mask] + cost
+            
+            # --- RIGHT VERTICAL POLE (capsule along z-axis) ---
+            right_pole_center_local = torch.tensor(
+                [0.0, frame_center_offset, 0.0], 
+                dtype=self.dtype, device=self.device
+            )
+            right_pole_center = gate_center + torch.matmul(gate_R, right_pole_center_local)
+            
+            rel_vec = pos - right_pole_center
+            z_proj = torch.sum(rel_vec * z_gate_axis, dim=-1)
+            z_clamped = torch.clamp(z_proj, -gate_half_height, gate_half_height)
+            closest_point = right_pole_center + z_clamped.unsqueeze(-1) * z_gate_axis.unsqueeze(0)
+            
+            dist = torch.norm(pos - closest_point, dim=-1)
+            surface_dist = dist - effective_radius
+            mask = surface_dist < penalty_threshold
+            
+            if torch.any(mask):
+                penalty = torch.exp(-surface_dist[mask] / (effective_radius * 0.5))
+                inv_dist_sq = 1.0 / (surface_dist[mask] ** 2 + 0.01)
+                cost = weight * penalty * inv_dist_sq
+                total_gate_cost = total_gate_cost.clone()
+                total_gate_cost[mask] = total_gate_cost[mask] + cost
+            
+            # --- TOP HORIZONTAL BAR (capsule along y-axis) ---
+            top_bar_center_local = torch.tensor(
+                [0.0, 0.0, frame_center_offset], 
+                dtype=self.dtype, device=self.device
+            )
+            top_bar_center = gate_center + torch.matmul(gate_R, top_bar_center_local)
+            
+            rel_vec = pos - top_bar_center
+            y_gate_axis = gate_R[:, 1]  # Y-axis of gate
+            y_proj = torch.sum(rel_vec * y_gate_axis, dim=-1)
+            y_clamped = torch.clamp(y_proj, -frame_center_offset, frame_center_offset)
+            closest_point = top_bar_center + y_clamped.unsqueeze(-1) * y_gate_axis.unsqueeze(0)
+            
+            dist = torch.norm(pos - closest_point, dim=-1)
+            surface_dist = dist - effective_radius
+            mask = surface_dist < penalty_threshold
+            
+            if torch.any(mask):
+                penalty = torch.exp(-surface_dist[mask] / (effective_radius * 0.5))
+                inv_dist_sq = 1.0 / (surface_dist[mask] ** 2 + 0.01)
+                cost = weight * penalty * inv_dist_sq
+                total_gate_cost = total_gate_cost.clone()
+                total_gate_cost[mask] = total_gate_cost[mask] + cost
+            
+            # --- BOTTOM HORIZONTAL BAR (capsule along y-axis) ---
+            bottom_bar_center_local = torch.tensor(
+                [0.0, 0.0, -frame_center_offset], 
+                dtype=self.dtype, device=self.device
+            )
+            bottom_bar_center = gate_center + torch.matmul(gate_R, bottom_bar_center_local)
+            
+            rel_vec = pos - bottom_bar_center
+            y_proj = torch.sum(rel_vec * y_gate_axis, dim=-1)
+            y_clamped = torch.clamp(y_proj, -frame_center_offset, frame_center_offset)
+            closest_point = bottom_bar_center + y_clamped.unsqueeze(-1) * y_gate_axis.unsqueeze(0)
+            
+            dist = torch.norm(pos - closest_point, dim=-1)
+            surface_dist = dist - effective_radius
+            mask = surface_dist < penalty_threshold
+            
+            if torch.any(mask):
+                penalty = torch.exp(-surface_dist[mask] / (effective_radius * 0.5))
+                inv_dist_sq = 1.0 / (surface_dist[mask] ** 2 + 0.01)
+                cost = weight * penalty * inv_dist_sq
+                total_gate_cost = total_gate_cost.clone()
+                total_gate_cost[mask] = total_gate_cost[mask] + cost
         
         return total_gate_cost
 
@@ -439,7 +514,7 @@ class AttitudeMPPIController(Controller):
         # Obstacle avoidance: vertical frames at y=±frame_center_offset (±0.2875m)
         dy_left = torch.abs(y_p + frame_center_offset)
         dy_right = torch.abs(y_p - frame_center_offset)
-        w_vert = 600.0  # Strong vertical frame avoidance
+        w_vert = 80.0  #600 # Proportional to opening attraction (40-15), scaled moderately higher for frame avoidance
         c_vert = w_vert * (torch.clamp(effective_avoid_dist - dy_left, min=0.0) ** 2 + torch.clamp(effective_avoid_dist - dy_right, min=0.0) ** 2)
 
         # Obstacle avoidance: horizontal frames at z=±frame_center_offset (±0.2875m)
@@ -447,7 +522,7 @@ class AttitudeMPPIController(Controller):
         dz_bottom = torch.abs(z_p + frame_center_offset)
         # Active only when within lateral span where horizontal bars exist
         within_span = torch.abs(y_p) <= (frame_center_offset + frame_radius + 0.05)
-        w_horiz = 550.0  # Strong horizontal frame avoidance
+        w_horiz = 80.0  #550 # Proportional to opening attraction (40-15), scaled moderately higher for frame avoidance
         c_horiz = torch.where(within_span, w_horiz * (torch.clamp(effective_avoid_dist - dz_top, min=0.0) ** 2 + torch.clamp(effective_avoid_dist - dz_bottom, min=0.0) ** 2), torch.zeros_like(dz_top))
 
         c_gate_struct = c_open_hinge + c_center + c_vert + c_horiz
