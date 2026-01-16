@@ -55,7 +55,7 @@ class AttitudeMPPIController(Controller):
         self.mppi_horizon = 25
         self.mppi_dt = self._dt * 2
         self.num_samples = 6000
-        self.lambda_weight = 9.5
+        self.lambda_weight = 9.5 #5 #9.5
 
         # Gate geometry constants
         self.gate_opening = 0.405
@@ -110,11 +110,11 @@ class AttitudeMPPIController(Controller):
 
         # Gate traversal configuration - RELAXED for less hesitation
         self.traversal_config = {
-            "approach_distance": 0.35,       # Reduced from 0.45
-            "exit_distance": 0.45,           # Increased from 0.30 - more clearance before turning
-            "align_threshold": 0.12,         # Reduced from 0.20
-            "traverse_threshold": 0.03,      # Reduced from 0.05
-            "exit_threshold": 0.20,          # Reduced from 0.30
+            "approach_distance": 0.0, #0.35,       # Reduced from 0.45
+            "exit_distance": 0.0, #0.45,           # Increased from 0.30 - more clearance before turning
+            "align_threshold": 0.0, #0.12,         # Reduced from 0.20
+            "traverse_threshold": 0.0, #0.03,      # Reduced from 0.05
+            "exit_threshold": 0.0, #0.20,          # Reduced from 0.30
             "max_gate_speed": 2.5,           # Increased from 1.8
             "corridor_far_radius": 0.8,      # Increased from 0.6
             "corridor_activation_dist": 0.4, # Reduced from 0.8 - only activate close to gate
@@ -137,7 +137,7 @@ class AttitudeMPPIController(Controller):
 
         # Pause mechanism
         self.pause_counter = 0
-        self.pause_duration = 10
+        self.pause_duration = 0 #10
 
         # Recently passed gate tracking for enhanced avoidance
         self.recently_passed_gate = -1

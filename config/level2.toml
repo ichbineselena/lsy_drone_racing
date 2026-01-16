@@ -34,7 +34,7 @@ camera_view = [5.0, 180.0, -25.0, 0.0, 0.0, 0.0] # Camera view [distance, azimut
 freq = 500                                        # Simulation frequency, in Hz
 attitude_freq = 500                               # Controller frequency, in Hz. This frequency is used to simulate the onboard controller, NOT for the environment's step function
 render = false                                    # Enable/disable PyBullet's GUI
-visualize = false                                  # Enable/disable visualization o the drone's path, obstacles pols, gates openings and the goal
+visualize = false #true                                  # Enable/disable visualization o the drone's path, obstacles pols, gates openings and the goal
 
 
 [env]
