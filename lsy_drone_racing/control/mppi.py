@@ -185,10 +185,16 @@ class AttitudeMPPIController(Controller):
             # Recently passed gate gets extra avoidance
             "recently_passed_multiplier": 2.5,  # Extra weight for just-passed gates
             "recently_passed_decay_steps": 50,  # Steps to decay the extra weight
+            
+            # Gate-progress objective (rewards forward progress through gate)
+            "gate_progress": 25.0,  # Weight for gate-progress term (dist_k1 - dist_k)
         }
 
         # Store previous control
         self.prev_control = None
+        
+        # Track previous position relative to gate plane for geometric crossing detection
+        self.prev_pos_gate_local = None  # Previous position in gate-local coordinates (x_n, y_p, z_p)
 
         # Define dynamics wrapper for MPPI
         def dynamics_fn(state, control):
@@ -717,6 +723,19 @@ class AttitudeMPPIController(Controller):
         x_n = torch.sum(rel * gate_R[:, 0], dim=-1)
         y_p = torch.sum(rel * gate_R[:, 1], dim=-1)
         z_p = torch.sum(rel * gate_R[:, 2], dim=-1)
+        
+        # 2a. Gate-progress objective: reward forward progress through gate
+        # Compute distance to gate center at current state (p_k)
+        dist_k = torch.sum((pos - gate_center) ** 2, dim=-1)
+        
+        # Compute next state (p_{k+1}) using dynamics
+        state_next = self.drone_model.dynamics(state, control, self.mppi_dt)
+        pos_next = state_next[..., 0:3]
+        dist_k1 = torch.sum((pos_next - gate_center) ** 2, dim=-1)
+        
+        # Gate-progress term: negative when moving closer → good (lower cost)
+        # This rewards trajectories that pass through and beyond the gate
+        c_gate_progress = self.cost_weights["gate_progress"] * (dist_k1 - dist_k)
 
         # 3.Gate structure cost (opening + frames) - primary gate shaping
         c_gate_struct = self.compute_gate_structure_cost(x_n, y_p, z_p)
@@ -748,6 +767,7 @@ class AttitudeMPPIController(Controller):
         # Total cost
         total_cost = (
             c_pos +
+            c_gate_progress +  # Gate-progress objective (rewards forward progress)
             c_gate_struct +
             c_corridor +
             c_vel +
@@ -790,9 +810,21 @@ class AttitudeMPPIController(Controller):
         if self.recently_passed_decay > 0:
             self.recently_passed_decay -= 1
 
-        # Handle target gate changes
+        # Geometric gate crossing detection (as per paper)
+        # Check if drone has crossed the gate plane (from in front to behind)
+        gate_crossed = self._detect_gate_crossing(drone_pos)
+        
+        # Handle target gate changes (either from environment or geometric detection)
         new_target_idx = int(obs["target_gate"])
-        if new_target_idx != self.target_gate_idx and self.pause_counter == 0:
+        
+        # If geometric detection found a crossing, use that to switch gates
+        if gate_crossed and self.pause_counter == 0:
+            next_gate_idx = (self.target_gate_idx + 1) % self.num_gates
+            if next_gate_idx != self.target_gate_idx:
+                print(f"[AttitudeMPPI] Geometric gate crossing detected! Switching to gate {next_gate_idx}")
+                self._handle_gate_change(obs, next_gate_idx)
+        elif new_target_idx != self.target_gate_idx and self.pause_counter == 0:
+            # Environment-based gate change (fallback)
             self._handle_gate_change(obs, new_target_idx)
         elif self.pause_counter > 0 and new_target_idx != self.target_gate_idx:
             if self.step_count % 10 == 0:
@@ -801,6 +833,9 @@ class AttitudeMPPIController(Controller):
         else:
             # Check for gate position updates
             self._check_gate_position_update(obs)
+        
+        # Update previous position for next iteration's crossing detection
+        self._update_prev_gate_position(drone_pos)
 
         # Update waypoint progress
         self._update_waypoint_progress(drone_pos)
@@ -844,6 +879,73 @@ class AttitudeMPPIController(Controller):
         except (IndexError, KeyError):
             pass
 
+    def _detect_gate_crossing(self, drone_pos: np.ndarray) -> bool:
+        """Detect if drone has geometrically crossed the gate plane.
+        
+        As per the paper: crossing is detected when current state is behind the gate plane
+        (x_n > 0 in gate-local coordinates) while previous state was in front (x_n < 0).
+        Also checks if the crossing point is within the gate opening.
+        
+        Args:
+            drone_pos: Current drone position in world frame
+            
+        Returns:
+            True if gate crossing detected, False otherwise
+        """
+        if self.prev_pos_gate_local is None:
+            return False
+        
+        # Transform current position to gate-local coordinates (consistent with _update_prev_gate_position)
+        rel_pos = drone_pos - self.current_gate_center
+        gate_R = R.from_quat(self.current_gate_quat).as_matrix()
+        
+        x_n_current = np.dot(rel_pos, gate_R[:, 0])
+        y_current = np.dot(rel_pos, gate_R[:, 1])
+        z_current = np.dot(rel_pos, gate_R[:, 2])
+        
+        # Get previous position in gate-local coordinates
+        x_n_prev = self.prev_pos_gate_local[0]
+        y_prev = self.prev_pos_gate_local[1]
+        z_prev = self.prev_pos_gate_local[2]
+        
+        # Check if crossing occurred: previous was in front (x_n < 0), current is behind (x_n > 0)
+        passed_plane = (x_n_prev < 0) and (x_n_current > 0)
+        
+        if not passed_plane:
+            return False
+        
+        # Check if crossing point is within gate opening
+        # Interpolate to find intersection point with gate plane (x_n = 0)
+        if abs(x_n_current - x_n_prev) < 1e-6:
+            return False
+        
+        alpha = -x_n_prev / (x_n_current - x_n_prev)
+        
+        # Interpolated intersection point
+        y_intersect = alpha * y_current + (1 - alpha) * y_prev
+        z_intersect = alpha * z_current + (1 - alpha) * z_prev
+        
+        # Check if intersection is within gate opening (gate_opening / 2 on each side)
+        opening_half = self.gate_opening / 2.0
+        in_box = (abs(y_intersect) < opening_half) and (abs(z_intersect) < opening_half)
+        
+        return in_box
+
+    def _update_prev_gate_position(self, drone_pos: np.ndarray):
+        """Update previous position in gate-local coordinates for crossing detection."""
+        try:
+            rel_pos = drone_pos - self.current_gate_center
+            gate_R = R.from_quat(self.current_gate_quat).as_matrix()
+            
+            x_n = np.dot(rel_pos, gate_R[:, 0])
+            y_p = np.dot(rel_pos, gate_R[:, 1])
+            z_p = np.dot(rel_pos, gate_R[:, 2])
+            
+            self.prev_pos_gate_local = np.array([x_n, y_p, z_p])
+        except (IndexError, KeyError, AttributeError):
+            # If gate info not available, reset tracking
+            self.prev_pos_gate_local = None
+
     def _handle_gate_change(self, obs: dict, new_target_idx: int):
         """Handle transition to new target gate."""
         print(f"\n[AttitudeMPPI] Target gate changed:  {self.target_gate_idx} -> {new_target_idx}")
@@ -865,6 +967,9 @@ class AttitudeMPPIController(Controller):
 
         # Update gate pose
         self._update_current_gate_pose(obs)
+
+        # Reset gate crossing detection (coordinates are now relative to new gate)
+        self.prev_pos_gate_local = None
 
         # Reset control sequence
         self._reset_control_sequence()
@@ -934,6 +1039,7 @@ class AttitudeMPPIController(Controller):
         self.waypoint_index = 0
         self.recently_passed_gate = -1
         self.recently_passed_decay = 0
+        self.prev_pos_gate_local = None  # Reset gate crossing detection
 
         print("[AttitudeMPPI] Episode reset")
 
