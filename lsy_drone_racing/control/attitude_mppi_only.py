@@ -661,12 +661,20 @@ class AttitudeMPPIController(Controller):
             if not self.goal_shifted and -0.1 < dist_to_plane < 0:  # Within 5cm before gate, and not yet shifted
                 self.goal_shifted = True  # Mark that we've shifted for this gate
                 self.prev_goal = self.goal.copy()
-                # Get forward direction from gate rotation
-                gate_quat = np.array(obs["gates_quat"][self.target_gate_idx], dtype=float)
-                rot = R.from_quat(gate_quat)
-                forward = rot.as_matrix()[:, 0]
-                # Move goal 8cm forward
-                self.goal = self.goal + 0.15 * forward
+                # Get forward direction based on drone's flying direction (velocity)
+                drone_vel = np.array(obs["vel"], dtype=float)
+                vel_magnitude = np.linalg.norm(drone_vel)
+                
+                if vel_magnitude > 0.1:  # Use drone velocity if moving with reasonable speed
+                    forward = drone_vel / vel_magnitude
+                else:
+                    # Fallback to gate direction if drone is moving slowly
+                    gate_quat = np.array(obs["gates_quat"][self.target_gate_idx], dtype=float)
+                    rot = R.from_quat(gate_quat)
+                    forward = rot.as_matrix()[:, 0]
+                
+                # Move goal 8cm forward in the direction the drone is flying
+
                 # Activate pause to maintain shifted goal and avoid immediate gate switching
                 self.pause_counter = self.pause_duration
                 print(f"\n[AttitudeMPPI] Case 3: Drone within 5cm before gate (dist={dist_to_plane:.3f}m), "
