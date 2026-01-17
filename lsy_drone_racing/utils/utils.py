@@ -118,6 +118,188 @@ def draw_line(
         )
 
 
+def draw_point(
+    env: RaceCoreEnv,
+    position: NDArray,
+    color: tuple = (1.0, 0.0, 0.0, 1.0),
+    size: float = 0.02,
+    sphere_segments: int = 8,
+):
+    """Draw a point as a sphere into the simulation.
+    
+    Args:
+        env: The drone racing environment.
+        position: 3D position of the point.
+        color: RGBA color tuple.
+        size: Radius of the sphere.
+        sphere_segments: Number of segments to approximate the sphere.
+    """
+    sim = env.unwrapped.sim
+    if sim.viewer is None:
+        return
+        
+    viewer = sim.viewer.viewer
+    rgba = np.array(color)
+    
+    # Draw sphere using a set of lines to approximate it
+    angles = np.linspace(0, 2*np.pi, sphere_segments)
+    
+    # Draw circles in XY plane
+    for angle in angles:
+        start = position.copy()
+        end = position.copy()
+        start[0] += size * np.cos(angle - np.pi/sphere_segments)
+        start[1] += size * np.sin(angle - np.pi/sphere_segments)
+        end[0] += size * np.cos(angle + np.pi/sphere_segments)
+        end[1] += size * np.sin(angle + np.pi/sphere_segments)
+        draw_line(env, np.array([start, end]), rgba=rgba, min_size=size*100, max_size=size*100)
+    
+    # Draw circles in XZ plane
+    for angle in angles:
+        start = position.copy()
+        end = position.copy()
+        start[0] += size * np.cos(angle - np.pi/sphere_segments)
+        start[2] += size * np.sin(angle - np.pi/sphere_segments)
+        end[0] += size * np.cos(angle + np.pi/sphere_segments)
+        end[2] += size * np.sin(angle + np.pi/sphere_segments)
+        draw_line(env, np.array([start, end]), rgba=rgba, min_size=size*100, max_size=size*100)
+    
+    # Draw circles in YZ plane
+    for angle in angles:
+        start = position.copy()
+        end = position.copy()
+        start[1] += size * np.cos(angle - np.pi/sphere_segments)
+        start[2] += size * np.sin(angle - np.pi/sphere_segments)
+        end[1] += size * np.cos(angle + np.pi/sphere_segments)
+        end[2] += size * np.sin(angle + np.pi/sphere_segments)
+        draw_line(env, np.array([start, end]), rgba=rgba, min_size=size*100, max_size=size*100)
+
+
+def draw_capsule(
+    env: RaceCoreEnv,
+    start: NDArray,
+    end: NDArray,
+    radius: float,
+    color: tuple = (0.0, 1.0, 1.0, 0.5),
+    segments: int = 8,
+):
+    """Draw a capsule into the simulation.
+    
+    Args:
+        env: The drone racing environment.
+        start: Start position of the capsule.
+        end: End position of the capsule.
+        radius: Radius of the capsule.
+        color: RGBA color tuple.
+        segments: Number of segments to approximate the capsule.
+    """
+    # Calculate direction vector and length
+    direction = end - start
+    length = np.linalg.norm(direction)
+    if length < 1e-6:
+        # If start and end are the same, draw a sphere
+        draw_point(env, start, color=color, size=radius)
+        return
+        
+    direction = direction / length
+    
+    # Find a perpendicular vector
+    if np.abs(direction[0]) < 0.9:
+        perp = np.cross(direction, np.array([1.0, 0.0, 0.0]))
+    else:
+        perp = np.cross(direction, np.array([0.0, 1.0, 0.0]))
+    perp = perp / np.linalg.norm(perp)
+    
+    # Find another perpendicular vector
+    perp2 = np.cross(direction, perp)
+    perp2 = perp2 / np.linalg.norm(perp2)
+    
+    rgba = np.array(color)
+    
+    # Draw cylindrical body using lines
+    angles = np.linspace(0, 2*np.pi, segments)
+    for angle in angles:
+        # Calculate circle point
+        circle_vec = radius * (np.cos(angle) * perp + np.sin(angle) * perp2)
+        
+        # Draw line along the cylinder
+        line_start = start + circle_vec
+        line_end = end + circle_vec
+        draw_line(env, np.array([line_start, line_end]), rgba=rgba, 
+                 min_size=radius*50, max_size=radius*50)
+    
+    # Draw end caps (hemispheres)
+    cap_segments = segments // 2
+    for i in range(cap_segments):
+        phi = i * np.pi / cap_segments
+        for j in range(segments):
+            theta = j * 2*np.pi / segments
+            
+            # Start cap
+            cap_offset = radius * np.array([
+                np.sin(phi) * np.cos(theta),
+                np.sin(phi) * np.sin(theta),
+                np.cos(phi)
+            ])
+            # Rotate cap_offset to align with direction
+            if phi <= np.pi/2:  # Start hemisphere
+                cap_pos = start + cap_offset
+            else:  # End hemisphere
+                cap_pos = end - cap_offset
+                
+            # Draw small line at cap position
+            draw_line(env, np.array([cap_pos, cap_pos + 0.001*direction]), 
+                     rgba=rgba, min_size=radius*30, max_size=radius*30)
+
+
+def draw_box(
+    env: RaceCoreEnv,
+    center: NDArray,
+    quat: NDArray,
+    half_sizes: NDArray,
+    color: tuple = (1.0, 1.0, 0.0, 0.5),
+):
+    """Draw a box into the simulation.
+    
+    Args:
+        env: The drone racing environment.
+        center: Center position of the box.
+        quat: Quaternion orientation of the box.
+        half_sizes: Half sizes of the box in x, y, z directions.
+        color: RGBA color tuple.
+    """
+    rot = R.from_quat(quat)
+    R_matrix = rot.as_matrix()
+    
+    rgba = np.array(color)
+    
+    # Define the 8 corners of the box in local coordinates
+    corners_local = np.array([
+        [-half_sizes[0], -half_sizes[1], -half_sizes[2]],
+        [ half_sizes[0], -half_sizes[1], -half_sizes[2]],
+        [ half_sizes[0],  half_sizes[1], -half_sizes[2]],
+        [-half_sizes[0],  half_sizes[1], -half_sizes[2]],
+        [-half_sizes[0], -half_sizes[1],  half_sizes[2]],
+        [ half_sizes[0], -half_sizes[1],  half_sizes[2]],
+        [ half_sizes[0],  half_sizes[1],  half_sizes[2]],
+        [-half_sizes[0],  half_sizes[1],  half_sizes[2]],
+    ])
+    
+    # Transform to world coordinates
+    corners_world = np.array([center + R_matrix @ corner for corner in corners_local])
+    
+    # Draw edges of the box
+    edges = [
+        (0, 1), (1, 2), (2, 3), (3, 0),  # Bottom face
+        (4, 5), (5, 6), (6, 7), (7, 4),  # Top face
+        (0, 4), (1, 5), (2, 6), (3, 7)   # Vertical edges
+    ]
+    
+    for edge in edges:
+        draw_line(env, np.array([corners_world[edge[0]], corners_world[edge[1]]]), 
+                 rgba=rgba, min_size=1.0, max_size=1.0)
+
+
 def _rotation_matrix_from_points(p1: NDArray, p2: NDArray) -> R:
     """Generate rotation matrices that align their z-axis to p2-p1."""
     z_axis = (v := p2 - p1) / np.linalg.norm(v, axis=-1, keepdims=True)

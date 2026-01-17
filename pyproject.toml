@@ -143,6 +143,9 @@ export-submission = { cmd = "kaggle competitions submit -c lsy-drone-racing-ws-2
 pandas = "*"
 kaggle = "*"
 
+[tool.pixi.feature.online-submission.pypi-dependencies]
+pytorch-mppi = "*"
+
 # feature[tests]
 [tool.pixi.feature.tests.tasks]
 tests = { cmd = "pytest -v tests", description = "Run tests" }
