@@ -32,7 +32,7 @@ jobs:
           # don't activate env (we'll call pixi run -e test explicitly)
           activate-environment: false
           # prefer using existing lockfile if present (faster, deterministic)
-          locked: true
+          locked: false
 
       - name: Create online-submission times
         run: pixi run create-submission
