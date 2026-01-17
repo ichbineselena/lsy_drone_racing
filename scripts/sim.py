@@ -13,6 +13,11 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+# Suppress DLPack buffer alignment warnings
+logging.getLogger("tensorflow").setLevel(logging.ERROR)
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
 import fire
 import gymnasium
 import jax.numpy as jp
@@ -35,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 def simulate(
-    config: str = "level2_new.toml",
+    config: str = "level2.toml",
     controller: str | None = None,
     n_runs: int = 1,
     render: bool | None = None,

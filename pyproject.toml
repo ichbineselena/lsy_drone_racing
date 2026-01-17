@@ -142,6 +142,7 @@ export-submission = { cmd = "kaggle competitions submit -c lsy-drone-racing-ws-2
 [tool.pixi.feature.online-submission.dependencies]
 pandas = "*"
 kaggle = "*"
+pytorch = "2.9.1"
 
 # feature[tests]
 [tool.pixi.feature.tests.tasks]
