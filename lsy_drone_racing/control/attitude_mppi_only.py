@@ -17,7 +17,7 @@ import pytorch_mppi
 
 # Import our PyTorch dynamics model
 from drone_models.core import load_params
-from lsy_drone_racing.dynamics.model_torch import DroneModelTorch
+from lsy_drone_racing.utils.model_torch import DroneModelTorch
 
 from lsy_drone_racing.control import Controller
 
