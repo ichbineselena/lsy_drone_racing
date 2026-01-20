@@ -26,7 +26,7 @@ To run the MPPI-based controller please activate:
 pixi shell -e gpu
 ```
 The pixi shell initialized from our fork should already have pytorch-mppi dependency.
-The standard version uses [`mppi.py`](control/mppi.py) as the controller, which has more safety & smoothness measures implemented. For more aggressive flying, however less robustness, [`attitude_mppi_only.py`](control/attitude_mppi_only.py)attitude_mppi_only.py can be used.
+The standard version uses [`mppi.py`](control/mppi.py) as the controller, which has more safety & smoothness measures implemented. For more aggressive flying, however less robustness, [`attitude_mppi_only.py`](control/attitude_mppi_only.py) can be used.
 
 To turn on the visualization of the gate frame and obstacle avoidance regions and the MPPI controller's goal, set visualize=true in the used config file. Please note that visualization may affect the controller's performance. 
 
