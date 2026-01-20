@@ -25,17 +25,14 @@ for i in $(seq 1 $N_RUNS); do
     # Capture output
     output=$(python scripts/sim.py --config "$CONFIG" --n_runs 1 --render "$RENDER" 2>&1)
     
-    # Extract gates passed
-    gates=$(echo "$output" | grep "Gates passed:" | tail -1 | awk '{print $3}')
+    # Extract gates passed (format: "Gates passed: X" - extract the number at the end)
+    gates=$(echo "$output" | grep "Gates passed:" | tail -1 | grep -oE '[0-9]+$')
     
-    # Extract flight time
-    time=$(echo "$output" | grep "Flight time" | tail -1 | awk '{print $4}')
+    # Extract flight time (format: "Flight time (s): X.XX" - extract the number after the colon)
+    time=$(echo "$output" | grep "Flight time" | tail -1 | grep -oE '[0-9]+\.?[0-9]*$')
     
-    # Extract total number of gates from config or track
-    total_gates=$(echo "$output" | grep "Gates passed:" | tail -1 | awk '{print $3}')
-    
-    # Check if finished
-    finished=$(echo "$output" | grep "Finished:" | tail -1 | awk '{print $2}')
+    # Extract finished status
+    finished=$(echo "$output" | grep "Finished:" | tail -1 | grep -oE '(True|False)$')
     
     # Determine total gates (assume 4 if not specified)
     if [ "$finished" == "True" ]; then
