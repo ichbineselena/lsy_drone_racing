@@ -8,7 +8,7 @@ Enhanced with structured gate traversal and dynamic corridor constraints.
 from __future__ import annotations
 
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, List, Tuple
+from typing import TYPE_CHECKING, Tuple
 
 import numpy as np
 import torch
@@ -285,9 +285,6 @@ class AttitudeMPPIController(Controller):
         else:
             self.goal = self.gates_pos[self.target_gate_idx].copy()
 
-        self.prev_goal = self.goal.copy()
-        self.old_gate_pos = self.goal.copy()
-
     def _generate_gate_waypoints(self, obs: dict):
         """Generate waypoints for current target gate."""
         if self.target_gate_idx < 0 or self.target_gate_idx >= self.num_gates:
@@ -369,7 +366,6 @@ class AttitudeMPPIController(Controller):
 
         if dist_to_waypoint < threshold and self.waypoint_index < len(self.waypoints) - 1:
             self.waypoint_index += 1
-            self.prev_goal = self.goal.copy()
             self.goal = self.waypoints[self.waypoint_index].copy()
             print(f"[AttitudeMPPI] Advanced to waypoint {self.waypoint_index}/{len(self.waypoints)-1}")
 
@@ -962,7 +958,6 @@ class AttitudeMPPIController(Controller):
         self._generate_gate_waypoints(obs)
 
         if len(self.waypoints) > 0:
-            self.prev_goal = self.goal.copy()
             self.goal = self.waypoints[0].copy()
 
         # Update gate pose
@@ -1077,36 +1072,3 @@ class AttitudeMPPIController(Controller):
             import traceback
             traceback.print_exc()
             return np.array([])
-
-    def get_planned_trajectory(self) -> np.ndarray:
-        """Get the optimal planned trajectory from the last MPPI optimization."""
-        try:
-            current_state = self.mppi.U.new_zeros(1, self.drone_model.nx)
-            optimal_controls = self.mppi.U
-
-            trajectory = []
-            state_tensor = current_state.clone()
-
-            for t in range(min(self.mppi_horizon, 25)):
-                trajectory.append(state_tensor.clone())
-                control_t = optimal_controls[t].unsqueeze(0)
-                state_tensor = self.drone_model.dynamics(
-                    state_tensor,
-                    control_t,
-                    self.mppi_dt
-                )
-
-            trajectory_np = torch.cat(trajectory, dim=0).cpu().numpy()
-            return trajectory_np[: , 0:3]
-        except Exception: 
-            return np.array([])
-
-    def get_waypoints(self) -> np.ndarray:
-        """Get current waypoints for visualization."""
-        if len(self.waypoints) > 0:
-            return np.array(self.waypoints)
-        return np.array([])
-
-    def get_current_waypoint_index(self) -> int:
-        """Get current waypoint index."""
-        return self.waypoint_index
